@@ -1,15 +1,17 @@
 ---
 name: gitlab-create-issue
-description: Analyze requirements and create GitLab issue
+description: Create GitLab issue from requirements
 triggers:
   - "gitlab create"
   - "create issue"
-  - "new issue"
+  - "gitlab-create-issue"
+argument-hint: "<requirement-description>"
+level: 2
 ---
 
 # GitLab Issue Creator
 
-Analyzes requirements and creates a new GitLab issue.
+Creates a new GitLab issue from requirement description.
 
 ## Usage
 
@@ -19,16 +21,5 @@ Analyzes requirements and creates a new GitLab issue.
 
 ## Requirements
 
-- `GITLAB_TOKEN` environment variable with GitLab personal access token
-- GitLab project URL in `.omc/gitlab-project.json` or `GITLAB_PROJECT_URL`
-
-## Process
-
-1. Analyze the requirement description
-2. Generate issue title and detailed description
-3. Create issue via GitLab API
-4. Save issue URL to `.omc/gitlab-issue.json` for auto-commenting
-
-## Output
-
-Returns the created issue URL and number.
+- `GITLAB_TOKEN` environment variable
+- GitLab project URL in `.omc/gitlab-project.json`
