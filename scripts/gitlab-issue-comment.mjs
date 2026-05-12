@@ -14,8 +14,10 @@
 import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import https from 'node:https';
 
 const ENABLE_GITLAB_COMMENT = process.env.OMC_GITLAB_COMMENT !== 'false';
+const SKIP_TLS_VERIFY = process.env.GITLAB_SKIP_TLS_VERIFY === 'true';
 
 /**
  * Get GitLab issue URL from .omc/gitlab-issue.json or env var.
@@ -96,34 +98,56 @@ async function postComment(issueUrl, summary) {
   }
 
   try {
-    // Parse issue URL: https://gitlab.com/group/project/-/issues/123
-    const urlMatch = issueUrl.match(/gitlab\.com\/(.+?)\/-\/issues\/(\d+)/);
+    // Parse issue URL: https://gitlab.com/group/project/-/issues/123 or https://custom.host/group/project/-/issues/123
+    const urlMatch = issueUrl.match(/https?:\/\/([^\/]+)\/(.+?)\/-\/issues\/(\d+)/);
     if (!urlMatch) {
       return { success: false, error: 'Invalid GitLab issue URL' };
     }
 
-    const [, projectPath, issueIid] = urlMatch;
+    const [, host, projectPath, issueIid] = urlMatch;
     const encodedPath = projectPath.replace(/\//g, '%2F');
-    const apiUrl = `https://gitlab.com/api/v4/projects/${encodedPath}/issues/${issueIid}/notes`;
+    const apiUrl = `https://${host}/api/v4/projects/${encodedPath}/issues/${issueIid}/notes`;
 
     // Build comment body
-    const body = buildCommentBody(summary);
+    const commentBody = buildCommentBody(summary);
 
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'PRIVATE-TOKEN': token,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ body }),
+    // Use https module to support SKIP_TLS_VERIFY
+    return new Promise((resolve) => {
+      const url = new URL(apiUrl);
+      const postData = JSON.stringify({ body: commentBody });
+
+      const options = {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          'PRIVATE-TOKEN': token,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+        rejectUnauthorized: !SKIP_TLS_VERIFY,
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ success: true });
+          } else {
+            resolve({ success: false, error: `HTTP ${res.statusCode}: ${data}` });
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        resolve({ success: false, error: error.message });
+      });
+
+      req.write(postData);
+      req.end();
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return { success: false, error };
-    }
-
-    return { success: true };
   } catch (error) {
     return { success: false, error: error.message };
   }
