@@ -68,7 +68,8 @@ function assertSafeWorkerName(workerName: string): void {
  * The command:
  *   1. Exits early if a rebase/merge is in progress or the sentinel is present.
  *   2. Stages all changes.
- *   3. Commits only when there is a non-empty diff (skips empty diffs).
+ *   3. Generates a commit message using LLM (falls back to default if generation fails).
+ *   4. Commits only when there is a non-empty diff (skips empty diffs).
  *
  * `workerName` is interpolated into a single-quoted shell body, so it must
  * pass `WORKER_NAME_RE` to prevent shell injection.
@@ -78,11 +79,17 @@ function buildHookCommand(workerName: string): string {
   // Single-line POSIX sh command (no newlines — settings.json is a flat string).
   // The sentinel test must be `[ -e ${SENTINEL_FILENAME} ]` (one dot). A leading
   // `.` here would produce `..hook-paused` and never match the actual sentinel.
+  //
+  // LLM commit message generation:
+  // - Uses node to run the generate-commit-message.mjs script from repo root
+  // - Falls back to default message if script fails or returns empty
   return (
     `sh -c 'rebase_dir=$(git rev-parse --git-path rebase-merge 2>/dev/null || printf %s .git/rebase-merge); ` +
     `merge_head=$(git rev-parse --git-path MERGE_HEAD 2>/dev/null || printf %s .git/MERGE_HEAD); ` +
     `if [ -d "$rebase_dir" ] || [ -f "$merge_head" ] || [ -e ${SENTINEL_FILENAME} ]; then exit 0; fi; ` +
-    `git add -A && (git diff --cached --quiet || git commit -m "auto-commit by worker ${workerName} at $(date -Iseconds)")'`
+    `git add -A && ` +
+    `msg=$(node scripts/generate-commit-message.mjs --directory . 2>/dev/null || echo "auto-commit by worker ${workerName} at $(date -Iseconds)") && ` +
+    `(git diff --cached --quiet || git commit -m "$msg")'`
   );
 }
 

@@ -162,13 +162,15 @@ async function createIssue(projectUrl, title, description, labels) {
 }
 
 /**
- * Save issue URL for auto-commenting.
+ * Save issue metadata for auto-commenting.
+ * Includes both URL and IID for robust comment updates.
  */
-function saveIssueUrl(cwd, issueUrl) {
+function saveIssueMetadata(cwd, issueUrl, issueIid) {
   try {
     const configPath = join(cwd, '.omc', 'gitlab-issue.json');
     const config = {
       issue_url: issueUrl,
+      issue_iid: issueIid,
       updated_at: new Date().toISOString(),
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2));
@@ -216,7 +218,7 @@ async function main() {
   const issue = result.issue;
 
   // Save for auto-commenting
-  saveIssueUrl(cwd, issue.url);
+  saveIssueMetadata(cwd, issue.url, issue.iid);
 
   // Output result
   console.log(`✅ Issue 已创建: #${issue.iid}`);

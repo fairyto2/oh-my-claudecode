@@ -20,12 +20,13 @@ const ENABLE_GITLAB_COMMENT = process.env.OMC_GITLAB_COMMENT !== 'false';
 const SKIP_TLS_VERIFY = process.env.GITLAB_SKIP_TLS_VERIFY === 'true';
 
 /**
- * Get GitLab issue URL from .omc/gitlab-issue.json or env var.
+ * Get GitLab issue metadata from .omc/gitlab-issue.json or env var.
+ * Returns { url, iid } or null.
  */
-function getIssueUrl(cwd) {
+function getIssueMetadata(cwd) {
   // Try env var first
   if (process.env.GITLAB_ISSUE_URL) {
-    return process.env.GITLAB_ISSUE_URL;
+    return { url: process.env.GITLAB_ISSUE_URL, iid: null };
   }
 
   // Try .omc/gitlab-issue.json
@@ -33,7 +34,10 @@ function getIssueUrl(cwd) {
     const configPath = join(cwd, '.omc', 'gitlab-issue.json');
     if (existsSync(configPath)) {
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      return config.issue_url;
+      return {
+        url: config.issue_url,
+        iid: config.issue_iid || null,
+      };
     }
   } catch {
     // Fall through
@@ -90,21 +94,26 @@ function getSummary(cwd) {
 
 /**
  * Post comment to GitLab issue.
+ * Accepts issue metadata with url and optional iid.
  */
-async function postComment(issueUrl, summary) {
+async function postComment(issueMetadata, summary) {
   const token = process.env.GITLAB_TOKEN || process.env.OMC_GITLAB_TOKEN;
   if (!token) {
     return { success: false, error: 'No GitLab token configured' };
   }
 
   try {
+    const { url: issueUrl, iid: storedIid } = issueMetadata;
+
     // Parse issue URL: https://gitlab.com/group/project/-/issues/123 or https://custom.host/group/project/-/issues/123
     const urlMatch = issueUrl.match(/https?:\/\/([^\/]+)\/(.+?)\/-\/issues\/(\d+)/);
     if (!urlMatch) {
       return { success: false, error: 'Invalid GitLab issue URL' };
     }
 
-    const [, host, projectPath, issueIid] = urlMatch;
+    const [, host, projectPath, parsedIid] = urlMatch;
+    // Use stored IID if available, otherwise use parsed from URL
+    const issueIid = storedIid || parsedIid;
     const encodedPath = projectPath.replace(/\//g, '%2F');
     const apiUrl = `https://${host}/api/v4/projects/${encodedPath}/issues/${issueIid}/notes`;
 
@@ -190,14 +199,14 @@ async function main() {
       return;
     }
 
-    const issueUrl = getIssueUrl(cwd);
-    if (!issueUrl) {
+    const issueMetadata = getIssueMetadata(cwd);
+    if (!issueMetadata) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
 
     const summary = getSummary(cwd);
-    const result = await postComment(issueUrl, summary);
+    const result = await postComment(issueMetadata, summary);
 
     if (result.success) {
       console.log(JSON.stringify({
