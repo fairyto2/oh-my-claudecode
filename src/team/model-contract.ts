@@ -1,11 +1,11 @@
 import { spawnSync } from 'child_process';
-import { isAbsolute, normalize, win32 as win32Path } from 'path';
+import { isAbsolute, normalize, sep, win32 as win32Path } from 'path';
 import { validateTeamName } from './team-name.js';
 import { normalizeToCcAlias } from '../features/delegation-enforcer.js';
 import { isBedrock, isVertexAI, isProviderSpecificModelId } from '../config/models.js';
 import { isExternalLLMDisabled } from '../lib/security-config.js';
 
-export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor';
+export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
 
 export interface CliAgentContract {
   agentType: CliAgentType;
@@ -66,6 +66,7 @@ function getTrustedPrefixes(): string[] {
     trusted.push(`${home}/.local/bin`);
     trusted.push(`${home}/.nvm/`);
     trusted.push(`${home}/.cargo/bin`);
+    trusted.push(`${home}/.grok/bin`);
   }
 
   const custom = (process.env.OMC_TRUSTED_CLI_DIRS ?? '')
@@ -80,7 +81,17 @@ function getTrustedPrefixes(): string[] {
 
 function isTrustedPrefix(resolvedPath: string): boolean {
   const normalized = normalize(resolvedPath);
-  return getTrustedPrefixes().some(prefix => normalized.startsWith(normalize(prefix)));
+  return getTrustedPrefixes().some(prefix => {
+    // `normalize` strips trailing separators, so a plain `startsWith` would treat
+    // a sibling whose name merely begins with the prefix as trusted — e.g.
+    // `/usr/bin` would match `/usr/bin-malicious/grok`, and `~/.local/bin` would
+    // match `~/.local/bin-evil/x`. Enforce a directory boundary: the resolved
+    // path must be the trusted dir itself or a true descendant (prefix + sep).
+    const p = normalize(prefix);
+    if (normalized === p) return true;
+    const withSep = p.endsWith(sep) ? p : p + sep;
+    return normalized.startsWith(withSep);
+  });
 }
 
 function assertBinaryName(binary: string): void {
@@ -155,6 +166,7 @@ export function validateCliBinaryPath(binary: string): CliBinaryValidation {
 export const _testInternals = {
   UNTRUSTED_PATH_PATTERNS,
   getTrustedPrefixes,
+  isTrustedPrefix,
 };
 
 /**
@@ -232,6 +244,41 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     promptModeFlag: '-p',
     buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
       const args = ['--approval-mode', 'yolo'];
+      if (model) args.push('--model', model);
+      return [...args, ...extraFlags];
+    },
+    parseOutput(rawOutput: string): string {
+      return rawOutput.trim();
+    },
+  },
+  grok: {
+    agentType: 'grok',
+    binary: 'grok',
+    installInstructions: 'Install Grok Build: https://build.grok.com',
+    supportsPromptMode: true,
+    promptModeFlag: '-p',
+    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+      const args = ['--always-approve'];
+      if (model) args.push('--model', model);
+      return [...args, ...extraFlags];
+    },
+    parseOutput(rawOutput: string): string {
+      return rawOutput.trim();
+    },
+  },
+  antigravity: {
+    agentType: 'antigravity',
+    binary: 'agy',
+    installInstructions: 'Install the Antigravity CLI (agy) per the official instructions at https://antigravity.google, then verify with `agy --version`.',
+    supportsPromptMode: true,
+    promptModeFlag: '-p',
+    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+      // agy's `-p`/`--print` is appended by getPromptModeArgs as `-p <instruction>`,
+      // where the prompt is the VALUE of `-p` (not a boolean). All other flags
+      // MUST precede that `-p`, so buildLaunchArgs returns only the leading flags
+      // (like grok). --dangerously-skip-permissions suppresses approval prompts,
+      // so no trust-confirm send-keys is needed (unlike gemini). Verified agy 1.0.10.
+      const args = ['--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
       return [...args, ...extraFlags];
     },
@@ -322,6 +369,10 @@ export function isCliAvailable(agentType: CliAgentType): boolean {
 }
 
 export function validateCliAvailable(agentType: CliAgentType): void {
+  // Platform support first: a clear "unsupported on this OS" error is more useful
+  // than a binary-not-found message when the binary exists but headless mode is
+  // unsupported here (e.g. antigravity on Windows).
+  assertHeadlessSupported(agentType);
   if (!isCliAvailable(agentType)) {
     const contract = getContract(agentType);
     throw new Error(
@@ -377,6 +428,10 @@ const WORKER_MODEL_ENV_ALLOWLIST = [
   'OMC_CODEX_DEFAULT_MODEL',
   'OMC_EXTERNAL_MODELS_DEFAULT_GEMINI_MODEL',
   'OMC_GEMINI_DEFAULT_MODEL',
+  'OMC_EXTERNAL_MODELS_DEFAULT_GROK_MODEL',
+  'OMC_GROK_DEFAULT_MODEL',
+  'OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL',
+  'OMC_ANTIGRAVITY_DEFAULT_MODEL',
 ] as const;
 
 export function getWorkerEnv(
@@ -472,11 +527,44 @@ export function resolveClaudeWorkerModel(
  * Get the extra CLI args needed to pass an instruction in prompt mode.
  * Returns empty array if the agent does not support prompt mode.
  */
+/**
+ * Whether a CLI agent's headless/prompt mode is supported on the given platform.
+ * Antigravity (`agy`) `-p`/`--print` takes the prompt as an argv value and cannot
+ * read it from stdin; on Windows that argv path is unreliable and `agy` has known
+ * upstream Windows `-p` limitations. This centralizes the same platform support
+ * decision the advisor (`scripts/run-provider-advisor.js`) enforces for `omc ask`.
+ */
+export function isHeadlessSupportedOnPlatform(
+  agentType: CliAgentType,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (agentType === 'antigravity' && platform === 'win32') {
+    return false;
+  }
+  return true;
+}
+
+/** Throw a clear, actionable error if the agent's headless mode is unsupported here. */
+export function assertHeadlessSupported(agentType: CliAgentType): void {
+  if (!isHeadlessSupportedOnPlatform(agentType)) {
+    throw new Error(
+      `CLI agent '${agentType}' headless/prompt mode is not supported on Windows: ` +
+      `\`agy --print\` takes the prompt as an argv value (it cannot read stdin) and has ` +
+      `known upstream Windows \`-p\` limitations. Run '${agentType}' team workers on ` +
+      `macOS/Linux, or use the 'gemini' provider on Windows.`,
+    );
+  }
+}
+
 export function getPromptModeArgs(agentType: CliAgentType, instruction: string): string[] {
   const contract = getContract(agentType);
   if (!contract.supportsPromptMode) {
     return [];
   }
+  // Centralized platform guard: refuse unsupported headless paths (e.g. antigravity
+  // on Windows) before building `-p <prompt>`, so the team path fails clearly here
+  // instead of attempting an unreliable argv spawn that fails/hangs opaquely.
+  assertHeadlessSupported(agentType);
   // If a flag is defined (e.g. gemini's '-p'), prepend it; otherwise the
   // instruction is passed as a positional argument (e.g. codex [PROMPT]).
   if (contract.promptModeFlag) {

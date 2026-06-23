@@ -8,17 +8,35 @@
  * - createHudWatchPane login shell wrapping
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { execFileSync, spawnSync } from 'child_process';
+import { exec, execFile, execFileSync, spawnSync } from 'child_process';
 vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal();
     return {
         ...actual,
         execFileSync: vi.fn(),
+        exec: vi.fn(),
+        execFile: vi.fn(),
         spawnSync: vi.fn(),
     };
 });
-import { buildTmuxShellCommand, buildTmuxShellCommandWithEnv, createHudWatchPane, isClaudeAvailable, killTmuxPane, listHudWatchPaneIdsInCurrentWindow, resolveLaunchPolicy, tmuxExec, tmuxSpawn, wrapWithLoginShell, quoteShellArg, sanitizeTmuxToken, } from '../tmux-utils.js';
+import { buildTmuxShellCommand, buildTmuxShellCommandWithEnv, createHudWatchPane, isClaudeAvailable, killTmuxPane, listHudWatchPaneIdsInCurrentWindow, resolveLaunchPolicy, tmuxExec, tmuxEnv, tmuxSpawn, tmuxCmdAsync, wrapWithLoginShell, quoteShellArg, sanitizeTmuxToken, } from '../tmux-utils.js';
 const mockedExecFileSync = vi.mocked(execFileSync);
+const mockedExec = vi.mocked(exec);
+const mockedExecFile = vi.mocked(execFile);
+function mockExecFileAsync(stdout = '', stderr = '') {
+    mockedExecFile.mockImplementation(((_command, _args, _options, callback) => {
+        const cb = typeof _options === 'function' ? _options : callback;
+        cb?.(null, stdout, stderr);
+        return {};
+    }));
+}
+function mockExecAsync(stdout = '', stderr = '') {
+    mockedExec.mockImplementation(((_command, _options, callback) => {
+        const cb = typeof _options === 'function' ? _options : callback;
+        cb?.(null, stdout, stderr);
+        return {};
+    }));
+}
 const mockedSpawnSync = vi.mocked(spawnSync);
 const baselinePlatform = process.platform;
 afterEach(() => {
@@ -126,6 +144,45 @@ describe('isClaudeAvailable', () => {
         Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
     });
 });
+// ---------------------------------------------------------------------------
+// tmuxEnv — psmux detached-session env stripping (issue #3265)
+// ---------------------------------------------------------------------------
+describe('tmuxEnv', () => {
+    it('strips PSMUX_SESSION so psmux does not block detached new-session -d', () => {
+        vi.stubEnv('TMUX', '/tmp/tmux-0/default,1,0');
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        const env = tmuxEnv();
+        expect(env.TMUX).toBeUndefined();
+        expect(env.PSMUX_SESSION).toBeUndefined();
+    });
+    it('preserves unrelated env vars', () => {
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', '/tmp/cfg');
+        const env = tmuxEnv();
+        expect(env.CLAUDE_CONFIG_DIR).toBe('/tmp/cfg');
+        expect(env.PSMUX_SESSION).toBeUndefined();
+    });
+    it('passes a PSMUX_SESSION-free env to execFile for detached creation (stripTmux: true)', () => {
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        mockedExecFileSync.mockClear();
+        mockedExecFileSync.mockReturnValue('');
+        tmuxExec(['new-session', '-d', '-s', 'omc-detached'], { stripTmux: true });
+        const lastCall = mockedExecFileSync.mock.calls.at(-1);
+        expect(lastCall).toBeDefined();
+        const passedEnv = lastCall[2].env;
+        expect(passedEnv?.PSMUX_SESSION).toBeUndefined();
+    });
+    it('leaves PSMUX_SESSION intact when stripTmux is not set (in-session split path)', () => {
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        mockedExecFileSync.mockClear();
+        mockedExecFileSync.mockReturnValue('');
+        tmuxExec(['split-window', '-h']);
+        const lastCall = mockedExecFileSync.mock.calls.at(-1);
+        expect(lastCall).toBeDefined();
+        const passedEnv = lastCall[2].env;
+        expect(passedEnv?.PSMUX_SESSION).toBe('psmux-session-1');
+    });
+});
 describe('tmux command execution parity on Windows', () => {
     it('routes tmuxExec through COMSPEC when where resolves tmux.cmd', () => {
         const originalPlatform = process.platform;
@@ -190,6 +247,34 @@ describe('tmux command execution parity on Windows', () => {
         tmuxExec(['send-keys', 'foo(bar)']);
         expect(mockedExecFileSync).toHaveBeenLastCalledWith('C:\\Windows\\System32\\cmd.exe', ['/d', '/s', '/c', '"C:\\Program Files\\psmux\\tmux.cmd" send-keys "foo(bar)"'], expect.objectContaining({ encoding: 'utf-8' }));
         Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    });
+    it('uses argv execution for tmux format args on native Windows instead of POSIX shell quoting', async () => {
+        Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+        vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+        mockedSpawnSync.mockClear();
+        mockedExecFile.mockClear();
+        mockedExec.mockClear();
+        mockedSpawnSync.mockReturnValueOnce({
+            status: 0,
+            stdout: 'C:\\Program Files\\psmux\\tmux.cmd\r\n',
+            stderr: '',
+            pid: 0,
+            output: [],
+            signal: null,
+        });
+        mockExecFileAsync('42\n');
+        await tmuxCmdAsync(['display-message', '-p', '#{window_width}']);
+        expect(mockedExec).not.toHaveBeenCalled();
+        expect(mockedExecFile).toHaveBeenLastCalledWith('C:\\Windows\\System32\\cmd.exe', ['/d', '/s', '/c', '"C:\\Program Files\\psmux\\tmux.cmd" display-message -p #{window_width}'], expect.objectContaining({ encoding: 'utf-8' }), expect.any(Function));
+    });
+    it('keeps POSIX shell quoting for tmux format args outside native Windows', async () => {
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+        mockedExec.mockClear();
+        mockedExecFile.mockClear();
+        mockExecAsync('42\n');
+        await tmuxCmdAsync(['display-message', '-p', '#{window_width}']);
+        expect(mockedExecFile).not.toHaveBeenCalled();
+        expect(mockedExec).toHaveBeenLastCalledWith("tmux 'display-message' '-p' '#{window_width}'", expect.objectContaining({ encoding: 'utf-8' }), expect.any(Function));
     });
 });
 // ---------------------------------------------------------------------------

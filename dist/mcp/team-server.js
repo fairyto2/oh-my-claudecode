@@ -213,7 +213,7 @@ function makeJobResponse(jobId, job, extra = {}) {
 }
 const startSchema = z.object({
     teamName: z.string().describe('Slug name for the team (e.g. "auth-review")'),
-    agentTypes: z.array(z.string()).describe('Agent type per worker: "claude", "codex", or "gemini"'),
+    agentTypes: z.array(z.string()).describe('Agent type per worker: "claude", "codex", "gemini", or "antigravity"'),
     tasks: z.array(z.object({
         subject: z.string().describe('Brief task title'),
         description: z.string().describe('Full task description'),
@@ -247,7 +247,7 @@ async function handleStart(args) {
     const runtimeCliPath = join(__ownDir, 'runtime-cli.cjs');
     const job = { status: 'running', startedAt: Date.now(), teamName: input.teamName, cwd: input.cwd };
     omcTeamJobs.set(jobId, job);
-    const child = spawn('node', [runtimeCliPath], {
+    const child = spawn(process.execPath, [runtimeCliPath], {
         env: { ...process.env, OMC_JOB_ID: jobId, OMC_JOBS_DIR },
         stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -481,7 +481,7 @@ const TOOLS = [
             type: 'object',
             properties: {
                 teamName: { type: 'string', description: 'Slug name for the team' },
-                agentTypes: { type: 'array', items: { type: 'string' }, description: '"claude", "codex", or "gemini" per worker' },
+                agentTypes: { type: 'array', items: { type: 'string' }, description: '"claude", "codex", "gemini", or "antigravity" per worker' },
                 tasks: {
                     type: 'array',
                     items: {

@@ -6,7 +6,11 @@ import { exec, execFile, execFileSync, execSync, spawnSync, } from 'child_proces
 import { basename, isAbsolute, win32 as win32Path } from 'path';
 import { promisify } from 'util';
 export function tmuxEnv() {
-    const { TMUX: _, ...env } = process.env;
+    // Strip both TMUX (real tmux) and PSMUX_SESSION (psmux's drop-in tmux on
+    // native Windows). psmux gates `new-session -d` nesting on PSMUX_SESSION,
+    // not TMUX, so dropping only TMUX leaves psmux silently no-op'ing detached
+    // session creation. See issue #3265.
+    const { TMUX: _, PSMUX_SESSION: __, ...env } = process.env;
     return env;
 }
 function resolveEnv(opts) {
@@ -74,7 +78,7 @@ export function tmuxSpawn(args, opts) {
     return spawnSync(invocation.command, invocation.args, { encoding: 'utf-8', ...spawnOpts, env: resolveEnv(opts) });
 }
 export async function tmuxCmdAsync(args, opts) {
-    if (args.some(a => a.includes('#{'))) {
+    if (args.some(a => a.includes('#{')) && !isNativeWindowsShell()) {
         const escaped = args.map(a => "'" + a.replace(/'/g, "'\\''") + "'").join(' ');
         return tmuxShellAsync(escaped, opts);
     }

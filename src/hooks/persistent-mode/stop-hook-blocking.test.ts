@@ -60,6 +60,60 @@ function writePendingTodo(tempDir: string, content: string): void {
   );
 }
 
+function writeActiveRalphState(tempDir: string, sessionId: string): void {
+  const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(
+    join(sessionDir, "ralph-state.json"),
+    JSON.stringify({
+      active: true,
+      iteration: 1,
+      max_iterations: 50,
+      session_id: sessionId,
+      started_at: new Date().toISOString(),
+      last_checked_at: new Date().toISOString(),
+      prompt: "Test ralph task",
+    }),
+  );
+}
+
+function writeRunningBackgroundTask(tempDir: string, sessionId: string): void {
+  const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(
+    join(sessionDir, "hud-state.json"),
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      sessionId,
+      backgroundTasks: [
+        {
+          id: "bash-bg-1",
+          description: "npm run long-backtest",
+          agentType: "bash",
+          startedAt: new Date().toISOString(),
+          status: "running",
+        },
+      ],
+    }),
+  );
+}
+
+function writePendingScheduledWakeup(tempDir: string, sessionId: string): void {
+  const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(
+    join(sessionDir, "scheduled-wakeup-state.json"),
+    JSON.stringify({
+      active: true,
+      pending: true,
+      status: "pending",
+      session_id: sessionId,
+      created_at: new Date().toISOString(),
+      due_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    }),
+  );
+}
+
 function writeLegacyModeState(
   tempDir: string,
   fileName: string,
@@ -681,20 +735,7 @@ describe("Stop Hook Blocking Contract", () => {
 
     it("blocks stop for active ralph loop", async () => {
       const sessionId = "test-ralph-block";
-      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
-      mkdirSync(sessionDir, { recursive: true });
-      writeFileSync(
-        join(sessionDir, "ralph-state.json"),
-        JSON.stringify({
-          active: true,
-          iteration: 1,
-          max_iterations: 50,
-          session_id: sessionId,
-          started_at: new Date().toISOString(),
-          last_checked_at: new Date().toISOString(),
-          prompt: "Test ralph task",
-        })
-      );
+      writeActiveRalphState(tempDir, sessionId);
 
       const result = await checkPersistentModes(sessionId, tempDir);
       expect(result.shouldBlock).toBe(true);
@@ -703,6 +744,26 @@ describe("Stop Hook Blocking Contract", () => {
       const output = createHookOutput(result);
       expect(output.continue).toBe(false);
       expect(output.message).toContain("RALPH");
+    });
+
+    it("does not reinforce active ralph while an owned background Bash task is pending", async () => {
+      const sessionId = "test-ralph-bg-bash-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writeRunningBackgroundTask(tempDir, sessionId);
+
+      const result = await checkPersistentModes(sessionId, tempDir);
+      expect(result.shouldBlock).toBe(false);
+      expect(result.mode).toBe("none");
+    });
+
+    it("does not reinforce active ralph while a scheduled wakeup is pending", async () => {
+      const sessionId = "test-ralph-wakeup-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writePendingScheduledWakeup(tempDir, sessionId);
+
+      const result = await checkPersistentModes(sessionId, tempDir);
+      expect(result.shouldBlock).toBe(false);
+      expect(result.mode).toBe("none");
     });
 
     it("keeps blocking active ralph loop when stop reason is interrupt", async () => {
@@ -809,6 +870,163 @@ describe("Stop Hook Blocking Contract", () => {
       rmSync(tempDir, { recursive: true, force: true });
     });
 
+    type PersistentModeScriptMode =
+      | "ultrawork"
+      | "ralph"
+      | "autopilot"
+      | "ultragoal"
+      | "pipeline"
+      | "team"
+      | "ultraqa"
+      | "swarm";
+
+    const stopHookActiveModes: PersistentModeScriptMode[] = [
+      "ultrawork",
+      "ralph",
+      "autopilot",
+      "ultragoal",
+      "pipeline",
+      "team",
+      "ultraqa",
+      "swarm",
+    ];
+
+    function makeCaseDir(caseName: string): string {
+      const caseDir = join(tempDir, caseName);
+      mkdirSync(caseDir, { recursive: true });
+      execSync("git init -q", { cwd: caseDir });
+      return caseDir;
+    }
+
+    function writeActiveStopHookModeState(
+      caseDir: string,
+      sessionId: string,
+      mode: PersistentModeScriptMode,
+    ): void {
+      const stateDir = join(caseDir, ".omc", "state");
+      const sessionDir = join(stateDir, "sessions", sessionId);
+      const now = new Date().toISOString();
+
+      if (mode === "swarm") {
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(join(stateDir, "swarm-active.marker"), "");
+        writeFileSync(
+          join(stateDir, "swarm-summary.json"),
+          JSON.stringify({
+            active: true,
+            tasks_pending: 1,
+            tasks_claimed: 0,
+            reinforcement_count: 0,
+            started_at: now,
+            last_checked_at: now,
+            project_path: caseDir,
+          }),
+        );
+        return;
+      }
+
+      mkdirSync(sessionDir, { recursive: true });
+      const baseState = {
+        active: true,
+        session_id: sessionId,
+        started_at: now,
+        last_checked_at: now,
+        project_path: caseDir,
+        reinforcement_count: 0,
+      };
+
+      const stateByMode: Record<Exclude<PersistentModeScriptMode, "swarm">, Record<string, unknown>> = {
+        ultrawork: {
+          ...baseState,
+          original_prompt: "Test ultrawork task",
+        },
+        ralph: {
+          ...baseState,
+          iteration: 1,
+          max_iterations: 50,
+          prompt: "Test ralph task",
+        },
+        autopilot: {
+          ...baseState,
+          current_phase: "execution",
+        },
+        ultragoal: {
+          ...baseState,
+          current_phase: "in_progress",
+          max_reinforcements: 50,
+          objective: "Test ultragoal objective",
+        },
+        pipeline: {
+          ...baseState,
+          current_stage: 0,
+          stages: [{ name: "stage-one" }],
+        },
+        team: {
+          ...baseState,
+          current_phase: "team-exec",
+        },
+        ultraqa: {
+          ...baseState,
+          cycle: 1,
+          max_cycles: 10,
+          all_passing: false,
+        },
+      };
+
+      writeFileSync(
+        join(sessionDir, `${mode}-state.json`),
+        JSON.stringify(stateByMode[mode], null, 2),
+      );
+    }
+
+    it.each(stopHookActiveModes)(
+      "returns continue without decision:block when stop_hook_active is true and %s state is active",
+      (mode) => {
+        const caseDir = makeCaseDir(`stop-hook-active-${mode}`);
+        const sessionId = `stop-hook-active-${mode}`;
+        writeActiveStopHookModeState(caseDir, sessionId, mode);
+
+        const output = runScript({
+          directory: caseDir,
+          sessionId,
+          stop_hook_active: true,
+        });
+
+        expect(output.continue).toBe(true);
+        expect(output.suppressOutput).toBe(true);
+        expect(output.decision).not.toBe("block");
+      },
+    );
+
+    it.each(stopHookActiveModes)(
+      "preserves normal decision:block behavior when stop_hook_active is false and %s state is active",
+      (mode) => {
+        const caseDir = makeCaseDir(`stop-hook-inactive-false-${mode}`);
+        const sessionId = `stop-hook-inactive-false-${mode}`;
+        writeActiveStopHookModeState(caseDir, sessionId, mode);
+
+        const output = runScript({
+          directory: caseDir,
+          sessionId,
+          stop_hook_active: false,
+        });
+
+        expect(output.decision).toBe("block");
+      },
+    );
+
+    it.each(stopHookActiveModes)(
+      "preserves normal decision:block behavior when stop_hook_active is absent and %s state is active",
+      (mode) => {
+        const caseDir = makeCaseDir(`stop-hook-inactive-absent-${mode}`);
+        const sessionId = `stop-hook-inactive-absent-${mode}`;
+        writeActiveStopHookModeState(caseDir, sessionId, mode);
+
+        const output = runScript({ directory: caseDir, sessionId });
+
+        expect(output.decision).toBe("block");
+      },
+    );
 
     it("returns continue: true when ralph is awaiting confirmation", () => {
       const sessionId = "ralph-awaiting-confirmation-mjs";
@@ -835,23 +1053,32 @@ describe("Stop Hook Blocking Contract", () => {
 
     it("returns decision: block when ralph is active", () => {
       const sessionId = "ralph-mjs-test";
-      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
-      mkdirSync(sessionDir, { recursive: true });
-      writeFileSync(
-        join(sessionDir, "ralph-state.json"),
-        JSON.stringify({
-          active: true,
-          iteration: 1,
-          max_iterations: 50,
-          session_id: sessionId,
-          started_at: new Date().toISOString(),
-          last_checked_at: new Date().toISOString(),
-          prompt: "Test task",
-        })
-      );
+      writeActiveRalphState(tempDir, sessionId);
 
       const output = runScript({ directory: tempDir, sessionId });
       expect(output.decision).toBe("block");
+    });
+
+    it("returns continue: true for active ralph with pending background Bash task", () => {
+      const sessionId = "ralph-mjs-bg-bash-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writeRunningBackgroundTask(tempDir, sessionId);
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(String(output.reason || "")).not.toContain("[RALPH LOOP");
+    });
+
+    it("returns continue: true for active ralph with pending scheduled wakeup", () => {
+      const sessionId = "ralph-mjs-wakeup-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writePendingScheduledWakeup(tempDir, sessionId);
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(String(output.reason || "")).not.toContain("[RALPH LOOP");
     });
 
     it("returns continue: true for tombstoned stale ralph state", () => {
@@ -896,6 +1123,56 @@ describe("Stop Hook Blocking Contract", () => {
 
       const output = runScript({ directory: tempDir, sessionId });
       expect(output.decision).toBe("block");
+    });
+
+    it("does not echo the cached original prompt as a Task in ultrawork reinforcement", () => {
+      const sessionId = "ultrawork-mjs-no-original-task-echo";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const longOriginalPrompt = "Original prompt should not be echoed. ".repeat(20);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "ultrawork-state.json"),
+        JSON.stringify({
+          active: true,
+          started_at: new Date().toISOString(),
+          original_prompt: longOriginalPrompt,
+          current_objective: "Fix issue #2971 Stop-hook reinforcement",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+        })
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      const reason = String(output.reason || "");
+      expect(output.decision).toBe("block");
+      expect(reason).not.toContain("\nTask:");
+      expect(reason).not.toContain(longOriginalPrompt);
+      expect(reason).toContain("Current objective: Fix issue #2971 Stop-hook reinforcement");
+    });
+
+    it("surfaces cancel guidance on the first ultrawork reinforcement", () => {
+      const sessionId = "ultrawork-mjs-first-cancel-guidance";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "ultrawork-state.json"),
+        JSON.stringify({
+          active: true,
+          started_at: new Date().toISOString(),
+          original_prompt: "Do some ultrawork",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+        })
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      const reason = String(output.reason || "");
+      expect(output.decision).toBe("block");
+      expect(reason).toContain("[ULTRAWORK #1/");
+      expect(reason).toContain("/oh-my-claudecode:cancel");
+      expect(reason).not.toContain("\nTask:");
     });
 
     it("returns continue: true for tombstoned stale ultrawork state", () => {
@@ -988,6 +1265,51 @@ describe("Stop Hook Blocking Contract", () => {
       expect(output.decision).toBeUndefined();
     });
 
+    it("uses current_phase when autopilot phase is missing in mjs script", () => {
+      const sessionId = "autopilot-current-phase-mjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          current_phase: "execution",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          started_at: new Date().toISOString(),
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.decision).toBe("block");
+      expect(String(output.reason || "")).toContain("[AUTOPILOT - Phase: execution]");
+      expect(String(output.reason || "")).not.toContain("unspecified");
+    });
+
+    it("allows terminal current_phase-only autopilot state in mjs script", () => {
+      const sessionId = "autopilot-current-phase-complete-mjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          current_phase: "complete",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          started_at: new Date().toISOString(),
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+    });
+
     it("cleans orphaned unspecified autopilot routing echo state instead of reinforcing in mjs script", () => {
       const sessionId = "autopilot-routing-echo-orphan-mjs";
       const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
@@ -1011,6 +1333,53 @@ describe("Stop Hook Blocking Contract", () => {
       expect(existsSync(autopilotPath)).toBe(false);
     });
 
+
+    it("cleans slash autopilot execute routing echo state instead of reinforcing in mjs script", () => {
+      const sessionId = "autopilot-slash-routing-echo-orphan-mjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const autopilotPath = join(sessionDir, "autopilot-state.json");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        autopilotPath,
+        JSON.stringify({
+          active: true,
+          original_prompt: "/oh-my-claudecode:autopilot execute",
+          session_id: sessionId,
+          started_at: new Date().toISOString(),
+          last_checked_at: new Date().toISOString(),
+          reinforcement_count: 0,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(existsSync(autopilotPath)).toBe(false);
+    });
+
+    it("does not clear slash autopilot state once a real phase is present in mjs script", () => {
+      const sessionId = "autopilot-slash-active-phase-mjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const autopilotPath = join(sessionDir, "autopilot-state.json");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        autopilotPath,
+        JSON.stringify({
+          active: true,
+          phase: "expansion",
+          original_prompt: "/oh-my-claudecode:autopilot execute",
+          session_id: sessionId,
+          started_at: new Date().toISOString(),
+          last_checked_at: new Date().toISOString(),
+          reinforcement_count: 0,
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.decision).toBe("block");
+      expect(existsSync(autopilotPath)).toBe(true);
+    });
 
     it("returns decision: block when autopilot awaiting_confirmation is stale", () => {
       const sessionId = "autopilot-stale-awaiting-confirmation-mjs";
@@ -1339,6 +1708,105 @@ describe("Stop Hook Blocking Contract", () => {
       expect(output.reason).toContain("ULTRAWORK");
     });
 
+    it("does not echo the cached original prompt as a Task in cjs ultrawork reinforcement", () => {
+      const sessionId = "ultrawork-cjs-no-original-task-echo";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const longOriginalPrompt = "Cached original prompt should stay out of stop output. ".repeat(20);
+      writePendingTodo(tempDir, "keep cjs ultrawork active");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "ultrawork-state.json"),
+        JSON.stringify({
+          active: true,
+          started_at: new Date().toISOString(),
+          original_prompt: longOriginalPrompt,
+          task_summary: "Finish the Stop-hook prompt echo fix",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          project_path: tempDir,
+        })
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      const reason = String(output.reason || "");
+      expect(output.decision).toBe("block");
+      expect(reason).not.toContain("\nTask:");
+      expect(reason).not.toContain(longOriginalPrompt);
+      expect(reason).toContain("Current objective: Finish the Stop-hook prompt echo fix");
+    });
+
+    it("surfaces cancel guidance on the first cjs ultrawork reinforcement", () => {
+      const sessionId = "ultrawork-cjs-first-cancel-guidance";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      writePendingTodo(tempDir, "keep cjs ultrawork active");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "ultrawork-state.json"),
+        JSON.stringify({
+          active: true,
+          started_at: new Date().toISOString(),
+          original_prompt: "Do some cjs ultrawork",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          project_path: tempDir,
+        })
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      const reason = String(output.reason || "");
+      expect(output.decision).toBe("block");
+      expect(reason).toContain("[ULTRAWORK #1/");
+      expect(reason).toContain("/oh-my-claudecode:cancel");
+      expect(reason).not.toContain("\nTask:");
+    });
+
+    it("uses current_phase when autopilot phase is missing in cjs script", () => {
+      const sessionId = "autopilot-current-phase-cjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          current_phase: "execution",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          started_at: new Date().toISOString(),
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.decision).toBe("block");
+      expect(String(output.reason || "")).toContain("[AUTOPILOT - Phase: execution]");
+      expect(String(output.reason || "")).not.toContain("unspecified");
+    });
+
+    it("allows terminal current_phase-only autopilot state in cjs script", () => {
+      const sessionId = "autopilot-current-phase-complete-cjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          current_phase: "complete",
+          session_id: sessionId,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+          started_at: new Date().toISOString(),
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+    });
+
     it("cleans orphaned unspecified autopilot routing echo state instead of reinforcing in cjs script", () => {
       const sessionId = "autopilot-routing-echo-orphan-cjs";
       const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
@@ -1360,6 +1828,53 @@ describe("Stop Hook Blocking Contract", () => {
       expect(output.continue).toBe(true);
       expect(output.decision).toBeUndefined();
       expect(existsSync(autopilotPath)).toBe(false);
+    });
+
+    it("cleans slash autopilot execute routing echo state instead of reinforcing in cjs script", () => {
+      const sessionId = "autopilot-slash-routing-echo-orphan-cjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const autopilotPath = join(sessionDir, "autopilot-state.json");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        autopilotPath,
+        JSON.stringify({
+          active: true,
+          original_prompt: "/oh-my-claudecode:autopilot execute",
+          session_id: sessionId,
+          started_at: new Date().toISOString(),
+          last_checked_at: new Date().toISOString(),
+          reinforcement_count: 0,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(existsSync(autopilotPath)).toBe(false);
+    });
+
+    it("does not clear slash autopilot state once a real phase is present in cjs script", () => {
+      const sessionId = "autopilot-slash-active-phase-cjs";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      const autopilotPath = join(sessionDir, "autopilot-state.json");
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        autopilotPath,
+        JSON.stringify({
+          active: true,
+          phase: "expansion",
+          original_prompt: "/oh-my-claudecode:autopilot execute",
+          session_id: sessionId,
+          started_at: new Date().toISOString(),
+          last_checked_at: new Date().toISOString(),
+          reinforcement_count: 0,
+          project_path: tempDir,
+        }),
+      );
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.decision).toBe("block");
+      expect(existsSync(autopilotPath)).toBe(true);
     });
 
     it("ignores legacy local state when OMC_STATE_DIR is set", () => {
@@ -1410,6 +1925,28 @@ describe("Stop Hook Blocking Contract", () => {
         stop_reason: "oauth_expired",
       });
       expect(output.continue).toBe(true);
+    });
+
+    it("returns continue: true for active ralph with pending background Bash task", () => {
+      const sessionId = "ralph-cjs-bg-bash-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writeRunningBackgroundTask(tempDir, sessionId);
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(String(output.reason || "")).not.toContain("[RALPH LOOP");
+    });
+
+    it("returns continue: true for active ralph with pending scheduled wakeup", () => {
+      const sessionId = "ralph-cjs-wakeup-pending";
+      writeActiveRalphState(tempDir, sessionId);
+      writePendingScheduledWakeup(tempDir, sessionId);
+
+      const output = runScript({ directory: tempDir, sessionId });
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
+      expect(String(output.reason || "")).not.toContain("[RALPH LOOP");
     });
 
     it("returns continue: true for ScheduleWakeup-triggered stop", () => {

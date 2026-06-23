@@ -3119,6 +3119,9 @@ var require_utils = __commonJS({
     "use strict";
     var isUUID = RegExp.prototype.test.bind(/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu);
     var isIPv4 = RegExp.prototype.test.bind(/^(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)$/u);
+    var isHexPair = RegExp.prototype.test.bind(/^[\da-f]{2}$/iu);
+    var isUnreserved = RegExp.prototype.test.bind(/^[\da-z\-._~]$/iu);
+    var isPathCharacter = RegExp.prototype.test.bind(/^[\da-z\-._~!$&'()*+,;=:@/]$/iu);
     function stringArrayToHexStripped(input) {
       let acc = "";
       let code = 0;
@@ -3311,27 +3314,77 @@ var require_utils = __commonJS({
       }
       return output.join("");
     }
-    function normalizeComponentEncoding(component, esc2) {
-      const func = esc2 !== true ? escape : unescape;
-      if (component.scheme !== void 0) {
-        component.scheme = func(component.scheme);
+    var HOST_DELIMS = { "@": "%40", "/": "%2F", "?": "%3F", "#": "%23", ":": "%3A" };
+    var HOST_DELIM_RE = /[@/?#:]/g;
+    var HOST_DELIM_NO_COLON_RE = /[@/?#]/g;
+    function reescapeHostDelimiters(host, isIP) {
+      const re = isIP ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
+      re.lastIndex = 0;
+      return host.replace(re, (ch) => HOST_DELIMS[ch]);
+    }
+    function normalizePercentEncoding(input, decodeUnreserved = false) {
+      if (input.indexOf("%") === -1) {
+        return input;
       }
-      if (component.userinfo !== void 0) {
-        component.userinfo = func(component.userinfo);
+      let output = "";
+      for (let i = 0; i < input.length; i++) {
+        if (input[i] === "%" && i + 2 < input.length) {
+          const hex = input.slice(i + 1, i + 3);
+          if (isHexPair(hex)) {
+            const normalizedHex = hex.toUpperCase();
+            const decoded = String.fromCharCode(parseInt(normalizedHex, 16));
+            if (decodeUnreserved && isUnreserved(decoded)) {
+              output += decoded;
+            } else {
+              output += "%" + normalizedHex;
+            }
+            i += 2;
+            continue;
+          }
+        }
+        output += input[i];
       }
-      if (component.host !== void 0) {
-        component.host = func(component.host);
+      return output;
+    }
+    function normalizePathEncoding(input) {
+      let output = "";
+      for (let i = 0; i < input.length; i++) {
+        if (input[i] === "%" && i + 2 < input.length) {
+          const hex = input.slice(i + 1, i + 3);
+          if (isHexPair(hex)) {
+            const normalizedHex = hex.toUpperCase();
+            const decoded = String.fromCharCode(parseInt(normalizedHex, 16));
+            if (decoded !== "." && isUnreserved(decoded)) {
+              output += decoded;
+            } else {
+              output += "%" + normalizedHex;
+            }
+            i += 2;
+            continue;
+          }
+        }
+        if (isPathCharacter(input[i])) {
+          output += input[i];
+        } else {
+          output += escape(input[i]);
+        }
       }
-      if (component.path !== void 0) {
-        component.path = func(component.path);
+      return output;
+    }
+    function escapePreservingEscapes(input) {
+      let output = "";
+      for (let i = 0; i < input.length; i++) {
+        if (input[i] === "%" && i + 2 < input.length) {
+          const hex = input.slice(i + 1, i + 3);
+          if (isHexPair(hex)) {
+            output += "%" + hex.toUpperCase();
+            i += 2;
+            continue;
+          }
+        }
+        output += escape(input[i]);
       }
-      if (component.query !== void 0) {
-        component.query = func(component.query);
-      }
-      if (component.fragment !== void 0) {
-        component.fragment = func(component.fragment);
-      }
-      return component;
+      return output;
     }
     function recomposeAuthority(component) {
       const uriTokens = [];
@@ -3346,7 +3399,7 @@ var require_utils = __commonJS({
           if (ipV6res.isIPV6 === true) {
             host = `[${ipV6res.escapedHost}]`;
           } else {
-            host = component.host;
+            host = reescapeHostDelimiters(host, false);
           }
         }
         uriTokens.push(host);
@@ -3360,7 +3413,10 @@ var require_utils = __commonJS({
     module2.exports = {
       nonSimpleDomain,
       recomposeAuthority,
-      normalizeComponentEncoding,
+      reescapeHostDelimiters,
+      normalizePercentEncoding,
+      normalizePathEncoding,
+      escapePreservingEscapes,
       removeDotSegments,
       isIPv4,
       isUUID,
@@ -3584,12 +3640,12 @@ var require_schemes = __commonJS({
 var require_fast_uri = __commonJS({
   "node_modules/fast-uri/index.js"(exports2, module2) {
     "use strict";
-    var { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizeComponentEncoding, isIPv4, nonSimpleDomain } = require_utils();
+    var { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = require_utils();
     var { SCHEMES, getSchemeHandler } = require_schemes();
     function normalize8(uri, options) {
       if (typeof uri === "string") {
         uri = /** @type {T} */
-        serialize(parse7(uri, options), options);
+        normalizeString(uri, options);
       } else if (typeof uri === "object") {
         uri = /** @type {T} */
         parse7(serialize(uri, options), options);
@@ -3656,19 +3712,9 @@ var require_fast_uri = __commonJS({
       return target;
     }
     function equal(uriA, uriB, options) {
-      if (typeof uriA === "string") {
-        uriA = unescape(uriA);
-        uriA = serialize(normalizeComponentEncoding(parse7(uriA, options), true), { ...options, skipEscape: true });
-      } else if (typeof uriA === "object") {
-        uriA = serialize(normalizeComponentEncoding(uriA, true), { ...options, skipEscape: true });
-      }
-      if (typeof uriB === "string") {
-        uriB = unescape(uriB);
-        uriB = serialize(normalizeComponentEncoding(parse7(uriB, options), true), { ...options, skipEscape: true });
-      } else if (typeof uriB === "object") {
-        uriB = serialize(normalizeComponentEncoding(uriB, true), { ...options, skipEscape: true });
-      }
-      return uriA.toLowerCase() === uriB.toLowerCase();
+      const normalizedA = normalizeComparableURI(uriA, options);
+      const normalizedB = normalizeComparableURI(uriB, options);
+      return normalizedA !== void 0 && normalizedB !== void 0 && normalizedA.toLowerCase() === normalizedB.toLowerCase();
     }
     function serialize(cmpts, opts) {
       const component = {
@@ -3693,12 +3739,12 @@ var require_fast_uri = __commonJS({
       if (schemeHandler && schemeHandler.serialize) schemeHandler.serialize(component, options);
       if (component.path !== void 0) {
         if (!options.skipEscape) {
-          component.path = escape(component.path);
+          component.path = escapePreservingEscapes(component.path);
           if (component.scheme !== void 0) {
             component.path = component.path.split("%3A").join(":");
           }
         } else {
-          component.path = unescape(component.path);
+          component.path = normalizePercentEncoding(component.path);
         }
       }
       if (options.reference !== "suffix" && component.scheme) {
@@ -3733,7 +3779,16 @@ var require_fast_uri = __commonJS({
       return uriTokens.join("");
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
-    function parse7(uri, opts) {
+    function getParseError(parsed, matches) {
+      if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
+        return 'URI path must start with "/" when authority is present.';
+      }
+      if (typeof parsed.port === "number" && (parsed.port < 0 || parsed.port > 65535)) {
+        return "URI port is malformed.";
+      }
+      return void 0;
+    }
+    function parseWithStatus(uri, opts) {
       const options = Object.assign({}, opts);
       const parsed = {
         scheme: void 0,
@@ -3744,6 +3799,7 @@ var require_fast_uri = __commonJS({
         query: void 0,
         fragment: void 0
       };
+      let malformedAuthorityOrPort = false;
       let isIP = false;
       if (options.reference === "suffix") {
         if (options.scheme) {
@@ -3763,6 +3819,11 @@ var require_fast_uri = __commonJS({
         parsed.fragment = matches[8];
         if (isNaN(parsed.port)) {
           parsed.port = matches[5];
+        }
+        const parseError = getParseError(parsed, matches);
+        if (parseError !== void 0) {
+          parsed.error = parsed.error || parseError;
+          malformedAuthorityOrPort = true;
         }
         if (parsed.host) {
           const ipv4result = isIPv4(parsed.host);
@@ -3802,14 +3863,18 @@ var require_fast_uri = __commonJS({
               parsed.scheme = unescape(parsed.scheme);
             }
             if (parsed.host !== void 0) {
-              parsed.host = unescape(parsed.host);
+              parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP);
             }
           }
           if (parsed.path) {
-            parsed.path = escape(unescape(parsed.path));
+            parsed.path = normalizePathEncoding(parsed.path);
           }
           if (parsed.fragment) {
-            parsed.fragment = encodeURI(decodeURIComponent(parsed.fragment));
+            try {
+              parsed.fragment = encodeURI(decodeURIComponent(parsed.fragment));
+            } catch {
+              parsed.error = parsed.error || "URI malformed";
+            }
           }
         }
         if (schemeHandler && schemeHandler.parse) {
@@ -3818,7 +3883,29 @@ var require_fast_uri = __commonJS({
       } else {
         parsed.error = parsed.error || "URI can not be parsed.";
       }
-      return parsed;
+      return { parsed, malformedAuthorityOrPort };
+    }
+    function parse7(uri, opts) {
+      return parseWithStatus(uri, opts).parsed;
+    }
+    function normalizeString(uri, opts) {
+      return normalizeStringWithStatus(uri, opts).normalized;
+    }
+    function normalizeStringWithStatus(uri, opts) {
+      const { parsed, malformedAuthorityOrPort } = parseWithStatus(uri, opts);
+      return {
+        normalized: malformedAuthorityOrPort ? uri : serialize(parsed, opts),
+        malformedAuthorityOrPort
+      };
+    }
+    function normalizeComparableURI(uri, opts) {
+      if (typeof uri === "string") {
+        const { normalized, malformedAuthorityOrPort } = normalizeStringWithStatus(uri, opts);
+        return malformedAuthorityOrPort ? void 0 : normalized;
+      }
+      if (typeof uri === "object") {
+        return serialize(uri, opts);
+      }
     }
     var fastUri = {
       SCHEMES,
@@ -17963,6 +18050,9 @@ function parseJsonc(content) {
   return JSON.parse(cleaned);
 }
 function stripJsoncComments(content) {
+  return stripTrailingCommas(stripComments(content));
+}
+function stripComments(content) {
   let result = "";
   let i = 0;
   while (i < content.length) {
@@ -18001,6 +18091,47 @@ function stripJsoncComments(content) {
         i++;
       }
       continue;
+    }
+    result += content[i];
+    i++;
+  }
+  return result;
+}
+function stripTrailingCommas(content) {
+  let result = "";
+  let i = 0;
+  while (i < content.length) {
+    if (content[i] === '"') {
+      result += content[i];
+      i++;
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === "\\") {
+          result += content[i];
+          i++;
+          if (i < content.length) {
+            result += content[i];
+            i++;
+          }
+          continue;
+        }
+        result += content[i];
+        i++;
+      }
+      if (i < content.length) {
+        result += content[i];
+        i++;
+      }
+      continue;
+    }
+    if (content[i] === ",") {
+      let j = i + 1;
+      while (j < content.length && /\s/.test(content[j])) {
+        j++;
+      }
+      if (content[j] === "}" || content[j] === "]") {
+        i++;
+        continue;
+      }
     }
     result += content[i];
     i++;
@@ -18655,6 +18786,8 @@ async function ensureBridge(sessionId, projectDir) {
 }
 async function killBridgeWithEscalation(sessionId, options) {
   const gracePeriod = options?.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS;
+  const sigtermGraceMs = options?.sigtermGraceMs ?? SIGTERM_GRACE_MS;
+  const finalWaitMs = options?.finalWaitMs ?? 1e3;
   const startTime = Date.now();
   const metaPath = getBridgeMetaPath(sessionId);
   const meta = await safeReadJson(metaPath);
@@ -18688,10 +18821,10 @@ async function killBridgeWithEscalation(sessionId, options) {
   if (!await waitForExit(gracePeriod)) {
     terminatedBy = "SIGTERM";
     killProcessGroup(meta.pid, "SIGTERM");
-    if (!await waitForExit(SIGTERM_GRACE_MS)) {
+    if (!await waitForExit(sigtermGraceMs)) {
       terminatedBy = "SIGKILL";
       killProcessGroup(meta.pid, "SIGKILL");
-      await waitForExit(1e3);
+      await waitForExit(finalWaitMs);
     }
   }
   await deleteBridgeMeta(sessionId);
@@ -18709,7 +18842,7 @@ async function killBridgeWithEscalation(sessionId, options) {
     terminationTimeMs: Date.now() - startTime
   };
 }
-async function cleanupBridgeSessions(sessionIds) {
+async function cleanupBridgeSessions(sessionIds, options = {}) {
   const uniqueSessionIds = [...new Set(Array.from(sessionIds).filter(Boolean))];
   const result = {
     requestedSessions: uniqueSessionIds.length,
@@ -18717,7 +18850,7 @@ async function cleanupBridgeSessions(sessionIds) {
     terminatedSessions: 0,
     errors: []
   };
-  for (const sessionId of uniqueSessionIds) {
+  const cleanupOne = async (sessionId) => {
     try {
       ownedBridgeSessionIds.delete(sessionId);
       const metaPath = getBridgeMetaPath(sessionId);
@@ -18726,12 +18859,12 @@ async function cleanupBridgeSessions(sessionIds) {
       const lockPath = getSessionLockPath(sessionId);
       const hasArtifacts = fs3.existsSync(metaPath) || fs3.existsSync(socketPath) || fs3.existsSync(portPath) || fs3.existsSync(lockPath);
       if (!hasArtifacts) {
-        continue;
+        return;
       }
       result.foundSessions++;
       const meta = await safeReadJson(metaPath);
       if (meta && isValidBridgeMeta(meta)) {
-        const escalation = await killBridgeWithEscalation(sessionId);
+        const escalation = await killBridgeWithEscalation(sessionId, options);
         if (escalation.terminatedBy) {
           result.terminatedSessions++;
         }
@@ -18743,6 +18876,13 @@ async function cleanupBridgeSessions(sessionIds) {
       await removeFileIfExists(lockPath);
     } catch (error2) {
       result.errors.push(`session=${sessionId}: ${error2.message}`);
+    }
+  };
+  if (options.parallel) {
+    await Promise.all(uniqueSessionIds.map(cleanupOne));
+  } else {
+    for (const sessionId of uniqueSessionIds) {
+      await cleanupOne(sessionId);
     }
   }
   return result;
@@ -19109,6 +19249,13 @@ var LSP_SERVERS = {
     args: ["--stdio"],
     extensions: [".css", ".scss", ".less"],
     installHint: "npm install -g vscode-langservers-extracted"
+  },
+  vue: {
+    name: "Vue Language Server (Volar)",
+    command: "vue-language-server",
+    args: ["--stdio"],
+    extensions: [".vue"],
+    installHint: "npm install -g @vue/language-server"
   },
   yaml: {
     name: "YAML Language Server",
@@ -20315,7 +20462,13 @@ async function runLspAggregatedDiagnostics(directory, extensions = [".ts", ".tsx
   const files = findFiles(directory, extensions, ["node_modules", "dist", "build", ".git"]);
   const allDiagnostics = [];
   let filesChecked = 0;
+  const skippedFiles = [];
+  const installHintSet = /* @__PURE__ */ new Set();
   for (const file of files) {
+    if (!getServerForFile(file)) {
+      skippedFiles.push({ file, reason: "no language server registered for extension" });
+      continue;
+    }
     try {
       await lspClientManager.runWithClientLease(file, async (client) => {
         await client.openDocument(file);
@@ -20329,18 +20482,29 @@ async function runLspAggregatedDiagnostics(directory, extensions = [".ts", ".tsx
         }
         filesChecked++;
       });
-    } catch (_error) {
-      continue;
+    } catch (error2) {
+      const message = error2 instanceof Error ? error2.message : String(error2);
+      const match = message.match(/^Language server '([^']+)' not found\.\nInstall with: (.+)$/s);
+      if (match) {
+        installHintSet.add(match[2].trim());
+        skippedFiles.push({ file, reason: `missing language server: ${match[1]}` });
+      } else {
+        skippedFiles.push({ file, reason: message });
+      }
     }
   }
   const errorCount = allDiagnostics.filter((d) => d.diagnostic.severity === 1).length;
   const warningCount = allDiagnostics.filter((d) => d.diagnostic.severity === 2).length;
+  const installHints = Array.from(installHintSet);
+  const allFilesSkipped = filesChecked === 0 && files.length > 0;
   return {
-    success: errorCount === 0,
+    success: errorCount === 0 && !allFilesSkipped,
     diagnostics: allDiagnostics,
     errorCount,
     warningCount,
-    filesChecked
+    filesChecked,
+    skippedFiles,
+    installHints
   };
 }
 
@@ -20400,25 +20564,41 @@ function formatTscResult(result) {
 function formatLspResult(result) {
   let diagnostics = "";
   let summary = "";
-  if (result.diagnostics.length === 0) {
+  if (result.diagnostics.length === 0 && result.installHints.length === 0 && result.skippedFiles.length === 0) {
     diagnostics = `Checked ${result.filesChecked} files. No diagnostics found!`;
     summary = `LSP check passed: 0 errors, 0 warnings (${result.filesChecked} files)`;
   } else {
-    const byFile = /* @__PURE__ */ new Map();
-    for (const item of result.diagnostics) {
-      if (!byFile.has(item.file)) {
-        byFile.set(item.file, []);
+    const hasSkips = result.skippedFiles.length > 0;
+    const parts = [];
+    if (result.installHints.length > 0) {
+      const hintLines = result.installHints.map((h) => `  - ${h}`).join("\n");
+      parts.push(
+        `\u26A0 Missing language servers detected:
+${hintLines}
+Install the language server(s) above and re-run, or these files cannot be checked.`
+      );
+    }
+    if (result.diagnostics.length > 0) {
+      const byFile = /* @__PURE__ */ new Map();
+      for (const item of result.diagnostics) {
+        if (!byFile.has(item.file)) {
+          byFile.set(item.file, []);
+        }
+        byFile.get(item.file).push(item);
       }
-      byFile.get(item.file).push(item);
-    }
-    const fileOutputs = [];
-    for (const [file, items] of byFile) {
-      const diags = items.map((i) => i.diagnostic);
-      fileOutputs.push(`${file}:
+      const fileOutputs = [];
+      for (const [file, items] of byFile) {
+        const diags = items.map((i) => i.diagnostic);
+        fileOutputs.push(`${file}:
 ${formatDiagnostics(diags, file)}`);
+      }
+      parts.push(fileOutputs.join("\n\n"));
     }
-    diagnostics = fileOutputs.join("\n\n");
-    summary = `LSP check ${result.success ? "passed" : "failed"}: ${result.errorCount} errors, ${result.warningCount} warnings (${result.filesChecked} files)`;
+    if (hasSkips) {
+      parts.push(`Skipped ${result.skippedFiles.length} file(s) due to missing or unregistered language servers.`);
+    }
+    diagnostics = parts.join("\n\n");
+    summary = hasSkips ? `LSP check incomplete: ${result.errorCount} errors, ${result.warningCount} warnings (${result.filesChecked}/${result.filesChecked + result.skippedFiles.length} files checked)` : `LSP check ${result.success ? "passed" : "failed"}: ${result.errorCount} errors, ${result.warningCount} warnings (${result.filesChecked} files)`;
   }
   return {
     strategy: "lsp",
@@ -20817,6 +20997,14 @@ var import_child_process8 = require("child_process");
 var import_fs10 = require("fs");
 var import_os3 = require("os");
 var import_path11 = require("path");
+
+// src/utils/encode-project-path.ts
+function encodeProjectPath(projectPath) {
+  return projectPath.replace(/[/\\.:]/g, "-");
+}
+
+// src/lib/worktree-paths.ts
+var WORKSPACE_MARKER = ".omc-workspace";
 var OmcPaths = {
   ROOT: ".omc",
   STATE: ".omc/state",
@@ -20836,6 +21024,61 @@ var OmcPaths = {
 };
 var MAX_WORKTREE_CACHE_SIZE = 8;
 var worktreeCacheMap = /* @__PURE__ */ new Map();
+var workspaceCacheMap = /* @__PURE__ */ new Map();
+function findWorkspaceRoot(startDir) {
+  if (process.env.OMC_DISABLE_MULTIREPO === "1") return null;
+  const effectiveStart = startDir || process.cwd();
+  let current;
+  try {
+    current = (0, import_path11.resolve)(effectiveStart);
+  } catch {
+    return null;
+  }
+  if (workspaceCacheMap.has(current)) {
+    const cached2 = workspaceCacheMap.get(current) ?? null;
+    workspaceCacheMap.delete(current);
+    workspaceCacheMap.set(current, cached2);
+    return cached2;
+  }
+  const home = (() => {
+    try {
+      return (0, import_path11.resolve)((0, import_os3.homedir)());
+    } catch {
+      return null;
+    }
+  })();
+  let cursor = current;
+  let result = null;
+  while (true) {
+    if (home && cursor === home) break;
+    if ((0, import_fs10.existsSync)((0, import_path11.join)(cursor, WORKSPACE_MARKER))) {
+      result = cursor;
+      break;
+    }
+    const parent = (0, import_path11.dirname)(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  if (workspaceCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+    const oldest = workspaceCacheMap.keys().next().value;
+    if (oldest !== void 0) workspaceCacheMap.delete(oldest);
+  }
+  workspaceCacheMap.set(current, result);
+  return result;
+}
+function readWorkspaceMarkerConfig(workspaceRoot) {
+  try {
+    const raw = (0, import_fs10.readFileSync)((0, import_path11.join)(workspaceRoot, WORKSPACE_MARKER), "utf-8").trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
 function getWorktreeRoot(cwd) {
   const effectiveCwd = cwd || process.cwd();
   if (worktreeCacheMap.has(effectiveCwd)) {
@@ -20874,6 +21117,18 @@ function validatePath(inputPath) {
 var dualDirWarnings = /* @__PURE__ */ new Set();
 function getProjectIdentifier(worktreeRoot) {
   const root = worktreeRoot || getWorktreeRoot() || process.cwd();
+  const workspaceRoot = findWorkspaceRoot(root);
+  if (workspaceRoot) {
+    const cfg = readWorkspaceMarkerConfig(workspaceRoot);
+    if (cfg.id && typeof cfg.id === "string" && cfg.id.trim()) {
+      const safeId = cfg.id.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+      const hash3 = (0, import_crypto.createHash)("sha256").update(safeId).digest("hex").slice(0, 16);
+      return `${safeId}-${hash3}`;
+    }
+    const hash2 = (0, import_crypto.createHash)("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+    const dirName2 = (0, import_path11.basename)(workspaceRoot).replace(/[^a-zA-Z0-9_-]/g, "_");
+    return `${dirName2}-${hash2}`;
+  }
   let source;
   try {
     const remoteUrl = (0, import_child_process8.execSync)("git remote get-url origin", {
@@ -20922,6 +21177,10 @@ function getOmcRoot(worktreeRoot) {
       );
     }
     return centralizedPath;
+  }
+  const workspaceAnchor = findWorkspaceRoot(worktreeRoot);
+  if (workspaceAnchor) {
+    return (0, import_path11.join)(workspaceAnchor, OmcPaths.ROOT);
   }
   const root = worktreeRoot || getWorktreeRoot() || process.cwd();
   return (0, import_path11.join)(root, OmcPaths.ROOT);
@@ -22491,7 +22750,27 @@ var pythonReplTool = {
 
 // src/tools/state-tools.ts
 var import_fs14 = require("fs");
+var import_os4 = require("os");
 var import_path15 = require("path");
+
+// src/lib/session-id.ts
+function readEnv() {
+  const value = process.env.OMC_SESSION_ID;
+  return value && value.trim() ? value.trim() : void 0;
+}
+function readPayload(payload) {
+  if (!payload || typeof payload !== "object") return void 0;
+  const value = payload.session_id;
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function resolveSessionId(input) {
+  const env = readEnv();
+  const payload = readPayload(input.hookPayload);
+  if (input.context === "cli") {
+    return env ?? payload;
+  }
+  return payload ?? env;
+}
 
 // src/lib/payload-limits.ts
 var DEFAULT_PAYLOAD_LIMITS = {
@@ -22949,6 +23228,99 @@ var STATE_TOOL_MODES = [
 ];
 var EXTRA_STATE_ONLY_MODES = ["ralplan", "omc-teams", "skill-active"];
 var CANCEL_SIGNAL_TTL_MS = 3e4;
+var OWNER_SESSION_FALLBACK_MODES = /* @__PURE__ */ new Set(["ralph"]);
+var CONVERGED_STATE_PATH_MODES = /* @__PURE__ */ new Set(["ralph", "ultrawork"]);
+function getStateFileName(mode) {
+  const normalizedName = mode.endsWith("-state") ? mode : `${mode}-state`;
+  return `${normalizedName}.json`;
+}
+function readJsonRecord(filePath) {
+  try {
+    return JSON.parse((0, import_fs14.readFileSync)(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+function listSessionIdsUnderOmcRoot(omcRoot) {
+  const sessionsDir = (0, import_path15.join)(omcRoot, "state", "sessions");
+  if (!(0, import_fs14.existsSync)(sessionsDir)) {
+    return [];
+  }
+  try {
+    return (0, import_fs14.readdirSync)(sessionsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).filter((name) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(name));
+  } catch {
+    return [];
+  }
+}
+function getConvergedOmcRoots(root) {
+  const roots = /* @__PURE__ */ new Set([getOmcRoot(root)]);
+  roots.add((0, import_path15.join)(root, OmcPaths.ROOT));
+  roots.add((0, import_path15.join)((0, import_os4.homedir)(), OmcPaths.ROOT));
+  return [...roots];
+}
+function getConvergedStateCandidates(mode, root, sessionId) {
+  if (!CONVERGED_STATE_PATH_MODES.has(mode)) {
+    return [];
+  }
+  const filename = getStateFileName(mode);
+  const paths = /* @__PURE__ */ new Set();
+  for (const omcRoot of getConvergedOmcRoots(root)) {
+    const stateDir = (0, import_path15.join)(omcRoot, "state");
+    if (sessionId) {
+      paths.add((0, import_path15.join)(stateDir, "sessions", sessionId, filename));
+      for (const sid of listSessionIdsUnderOmcRoot(omcRoot)) {
+        const candidatePath = (0, import_path15.join)(stateDir, "sessions", sid, filename);
+        const raw = readJsonRecord(candidatePath);
+        if (raw && getStateSessionOwner(raw) === sessionId) {
+          paths.add(candidatePath);
+        }
+      }
+    } else {
+      for (const sid of listSessionIdsUnderOmcRoot(omcRoot)) {
+        paths.add((0, import_path15.join)(stateDir, "sessions", sid, filename));
+      }
+    }
+    paths.add((0, import_path15.join)(stateDir, filename));
+    paths.add((0, import_path15.join)(omcRoot, filename));
+  }
+  return [...paths];
+}
+function isConvergedCandidateActiveForSession(statePath, sessionId) {
+  const raw = readJsonRecord(statePath);
+  if (!raw || raw.active !== true) {
+    return false;
+  }
+  if (!sessionId) {
+    return true;
+  }
+  return canClearStateForSession(raw, sessionId);
+}
+function clearConvergedStateCandidates(mode, root, sessionId) {
+  let cleared = 0;
+  let hadFailure = false;
+  const paths = getConvergedStateCandidates(mode, root, sessionId);
+  for (const statePath of paths) {
+    if (!(0, import_fs14.existsSync)(statePath)) {
+      continue;
+    }
+    try {
+      if (sessionId) {
+        const raw = readJsonRecord(statePath);
+        if (!canClearStateForSession(raw, sessionId)) {
+          continue;
+        }
+      }
+      (0, import_fs14.unlinkSync)(statePath);
+      cleared++;
+    } catch {
+      hadFailure = true;
+    }
+  }
+  return { cleared, hadFailure, paths };
+}
+function hasActiveConvergedState(mode, root, sessionId) {
+  return getConvergedStateCandidates(mode, root, sessionId).some((statePath) => isConvergedCandidateActiveForSession(statePath, sessionId));
+}
 function readTeamNamesFromStateFile(statePath) {
   if (!(0, import_fs14.existsSync)(statePath)) return [];
   try {
@@ -23023,6 +23395,60 @@ function getLegacyStateFileCandidates(mode, root) {
   ];
   return [...new Set(candidates)];
 }
+function getWorkingDirectoryLocalOmcRoot(root) {
+  return (0, import_path15.join)(root, OmcPaths.ROOT);
+}
+function shouldCheckWorkingDirectoryLocalState(root) {
+  return getWorkingDirectoryLocalOmcRoot(root) !== getOmcRoot(root);
+}
+function getWorkingDirectoryLocalSessionStatePath(mode, root, sessionId) {
+  const normalizedName = mode.endsWith("-state") ? mode : `${mode}-state`;
+  return (0, import_path15.join)(getWorkingDirectoryLocalOmcRoot(root), "state", "sessions", sessionId, `${normalizedName}.json`);
+}
+function getWorkingDirectoryLocalLegacyStateFileCandidates(mode, root) {
+  const normalizedName = mode.endsWith("-state") ? mode : `${mode}-state`;
+  return [
+    (0, import_path15.join)(getWorkingDirectoryLocalOmcRoot(root), "state", `${normalizedName}.json`),
+    (0, import_path15.join)(getWorkingDirectoryLocalOmcRoot(root), `${normalizedName}.json`)
+  ];
+}
+function getWorkingDirectoryLocalStateClearCandidates(mode, root, sessionId) {
+  if (!shouldCheckWorkingDirectoryLocalState(root)) {
+    return [];
+  }
+  const paths = /* @__PURE__ */ new Set();
+  if (sessionId) {
+    paths.add(getWorkingDirectoryLocalSessionStatePath(mode, root, sessionId));
+  }
+  for (const legacyPath of getWorkingDirectoryLocalLegacyStateFileCandidates(mode, root)) {
+    paths.add(legacyPath);
+  }
+  return [...paths];
+}
+function clearWorkingDirectoryLocalStateCandidates(mode, root, sessionId) {
+  let cleared = 0;
+  let hadFailure = false;
+  const paths = getWorkingDirectoryLocalStateClearCandidates(mode, root, sessionId);
+  const localLegacyPaths = new Set(getWorkingDirectoryLocalLegacyStateFileCandidates(mode, root));
+  for (const statePath of paths) {
+    if (!(0, import_fs14.existsSync)(statePath)) {
+      continue;
+    }
+    try {
+      if (sessionId && localLegacyPaths.has(statePath)) {
+        const raw = JSON.parse((0, import_fs14.readFileSync)(statePath, "utf-8"));
+        if (!canClearStateForSession(raw, sessionId)) {
+          continue;
+        }
+      }
+      (0, import_fs14.unlinkSync)(statePath);
+      cleared++;
+    } catch {
+      hadFailure = true;
+    }
+  }
+  return { cleared, hadFailure, paths };
+}
 function clearLegacyStateCandidates(mode, root, sessionId) {
   let cleared = 0;
   let hadFailure = false;
@@ -23072,6 +23498,33 @@ function clearCompletedSessionStateCandidates(mode, root, requesterSessionId) {
     }
   }
   return { cleared, hadFailure, paths };
+}
+function getStateClearCheckedPaths(mode, root, sessionId) {
+  const paths = /* @__PURE__ */ new Set();
+  if (sessionId) {
+    paths.add(MODE_CONFIGS[mode] ? getStateFilePath(root, mode, sessionId) : resolveSessionStatePath(mode, sessionId, root));
+  } else {
+    paths.add(getStatePath(mode, root));
+  }
+  for (const legacyPath of getLegacyStateFileCandidates(mode, root)) {
+    paths.add(legacyPath);
+  }
+  for (const localPath of getWorkingDirectoryLocalStateClearCandidates(mode, root, sessionId)) {
+    paths.add(localPath);
+  }
+  const sessionIds = sessionId ? [sessionId, ...listSessionIds(root)] : listSessionIds(root);
+  for (const sid of new Set(sessionIds)) {
+    paths.add(MODE_CONFIGS[mode] ? getStateFilePath(root, mode, sid) : resolveSessionStatePath(mode, sid, root));
+  }
+  return [...paths];
+}
+function formatStateClearNoopMessage(mode, root, sessionId) {
+  const scope = sessionId ? ` in session: ${sessionId}` : "";
+  const checkedPaths = getStateClearCheckedPaths(mode, root, sessionId);
+  const checked = checkedPaths.length > 0 ? `
+- Checked paths:
+${checkedPaths.map((statePath) => `  - ${statePath}`).join("\n")}` : "";
+  return `No state found to clear for mode: ${mode}${scope}${checked}`;
 }
 function getModeRuntimeArtifactNames(mode) {
   return [
@@ -23437,15 +23890,19 @@ var stateClearTool = {
         }
         const completedSessionCleanup = clearCompletedSessionStateCandidates(mode, root, sessionId);
         const runtimeCleanup2 = clearModeRuntimeArtifacts(mode, root, sessionId);
+        let convergedCleanup2 = { cleared: 0, hadFailure: false, paths: [] };
         writeSessionCancelSignal(root, sessionId, mode);
         if (MODE_CONFIGS[mode]) {
           const success = clearModeState(mode, root, sessionId);
           const sessionCleanup2 = clearSessionOwnedStateCandidates(mode, root, sessionId);
           const legacyCleanup2 = clearLegacyStateCandidates(mode, root, sessionId);
+          const shouldUseLocalFallback2 = requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup2.cleared === 0 && legacyCleanup2.cleared === 0;
+          const workingDirectoryLocalCleanup2 = shouldUseLocalFallback2 ? clearWorkingDirectoryLocalStateCandidates(mode, root, sessionId) : { cleared: 0, hadFailure: false, paths: [] };
+          convergedCleanup2 = clearConvergedStateCandidates(mode, root, sessionId);
           let ownerSessionId2;
           let ownerSessionCleanup2 = { cleared: 0, hadFailure: false, paths: [] };
           let ownerLegacyCleanup2 = { cleared: 0, hadFailure: false };
-          if (requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup2.cleared === 0 && legacyCleanup2.cleared === 0) {
+          if (OWNER_SESSION_FALLBACK_MODES.has(mode) && requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup2.cleared === 0 && legacyCleanup2.cleared === 0 && convergedCleanup2.cleared === 0 && workingDirectoryLocalCleanup2.cleared === 0) {
             ownerSessionId2 = findSingleOwningSessionForMode(mode, root, sessionId);
             if (ownerSessionId2) {
               if (mode === "team") {
@@ -23472,6 +23929,12 @@ var stateClearTool = {
           if (sessionCleanup2.cleared > 0) {
             ghostNoteParts2.push(`removed ${sessionCleanup2.cleared} recovered session file${sessionCleanup2.cleared === 1 ? "" : "s"}`);
           }
+          if (workingDirectoryLocalCleanup2.cleared > 0) {
+            ghostNoteParts2.push(`removed ${workingDirectoryLocalCleanup2.cleared} workingDirectory-local state file${workingDirectoryLocalCleanup2.cleared === 1 ? "" : "s"}`);
+          }
+          if (convergedCleanup2.cleared > 0) {
+            ghostNoteParts2.push(`removed ${convergedCleanup2.cleared} converged state file${convergedCleanup2.cleared === 1 ? "" : "s"}`);
+          }
           if (runtimeCleanup2.cleared > 0) {
             ghostNoteParts2.push(`removed ${runtimeCleanup2.cleared} runtime artifact${runtimeCleanup2.cleared === 1 ? "" : "s"}`);
           }
@@ -23489,7 +23952,16 @@ var stateClearTool = {
             if (prunedMissions > 0) details.push(`pruned ${prunedMissions} HUD mission entry(ies)`);
             return details.length > 0 ? ` (${details.join(", ")})` : "";
           })();
-          if (success && !legacyCleanup2.hadFailure && !sessionCleanup2.hadFailure && !completedSessionCleanup.hadFailure && !ownerSessionCleanup2.hadFailure && !ownerLegacyCleanup2.hadFailure && !runtimeCleanup2.hadFailure) {
+          const clearedStateOrArtifacts2 = requestedSessionOwnedPaths.length + completedSessionCleanup.cleared + sessionCleanup2.cleared + legacyCleanup2.cleared + convergedCleanup2.cleared + workingDirectoryLocalCleanup2.cleared + ownerSessionCleanup2.cleared + ownerLegacyCleanup2.cleared + runtimeCleanup2.cleared;
+          if (!ownerSessionId2 && clearedStateOrArtifacts2 === 0 && success && !legacyCleanup2.hadFailure && !sessionCleanup2.hadFailure && !workingDirectoryLocalCleanup2.hadFailure && !convergedCleanup2.hadFailure && !completedSessionCleanup.hadFailure && !ownerSessionCleanup2.hadFailure && !ownerLegacyCleanup2.hadFailure && !runtimeCleanup2.hadFailure) {
+            return {
+              content: [{
+                type: "text",
+                text: formatStateClearNoopMessage(mode, root, sessionId)
+              }]
+            };
+          }
+          if (success && !legacyCleanup2.hadFailure && !sessionCleanup2.hadFailure && !workingDirectoryLocalCleanup2.hadFailure && !convergedCleanup2.hadFailure && !completedSessionCleanup.hadFailure && !ownerSessionCleanup2.hadFailure && !ownerLegacyCleanup2.hadFailure && !runtimeCleanup2.hadFailure) {
             return {
               content: [{
                 type: "text",
@@ -23507,10 +23979,13 @@ var stateClearTool = {
         }
         const sessionCleanup = clearSessionOwnedStateCandidates(mode, root, sessionId);
         const legacyCleanup = clearLegacyStateCandidates(mode, root, sessionId);
+        const shouldUseLocalFallback = requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup.cleared === 0 && legacyCleanup.cleared === 0;
+        const workingDirectoryLocalCleanup = shouldUseLocalFallback ? clearWorkingDirectoryLocalStateCandidates(mode, root, sessionId) : { cleared: 0, hadFailure: false, paths: [] };
+        convergedCleanup2 = clearConvergedStateCandidates(mode, root, sessionId);
         let ownerSessionId;
         let ownerSessionCleanup = { cleared: 0, hadFailure: false, paths: [] };
         let ownerLegacyCleanup = { cleared: 0, hadFailure: false };
-        if (requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup.cleared === 0 && legacyCleanup.cleared === 0) {
+        if (OWNER_SESSION_FALLBACK_MODES.has(mode) && requestedSessionOwnedPaths.length === 0 && completedSessionCleanup.cleared === 0 && sessionCleanup.cleared === 0 && legacyCleanup.cleared === 0 && convergedCleanup2.cleared === 0 && workingDirectoryLocalCleanup.cleared === 0) {
           ownerSessionId = findSingleOwningSessionForMode(mode, root, sessionId);
           if (ownerSessionId) {
             if (mode === "team") {
@@ -23536,6 +24011,12 @@ var stateClearTool = {
         if (sessionCleanup.cleared > 0) {
           ghostNoteParts.push(`removed ${sessionCleanup.cleared} recovered session file${sessionCleanup.cleared === 1 ? "" : "s"}`);
         }
+        if (workingDirectoryLocalCleanup.cleared > 0) {
+          ghostNoteParts.push(`removed ${workingDirectoryLocalCleanup.cleared} workingDirectory-local state file${workingDirectoryLocalCleanup.cleared === 1 ? "" : "s"}`);
+        }
+        if (convergedCleanup2.cleared > 0) {
+          ghostNoteParts.push(`removed ${convergedCleanup2.cleared} converged state file${convergedCleanup2.cleared === 1 ? "" : "s"}`);
+        }
         if (runtimeCleanup2.cleared > 0) {
           ghostNoteParts.push(`removed ${runtimeCleanup2.cleared} runtime artifact${runtimeCleanup2.cleared === 1 ? "" : "s"}`);
         }
@@ -23553,10 +24034,20 @@ var stateClearTool = {
           if (prunedMissions > 0) details.push(`pruned ${prunedMissions} HUD mission entry(ies)`);
           return details.length > 0 ? ` (${details.join(", ")})` : "";
         })();
+        const clearedStateOrArtifacts = requestedSessionOwnedPaths.length + completedSessionCleanup.cleared + sessionCleanup.cleared + legacyCleanup.cleared + convergedCleanup2.cleared + workingDirectoryLocalCleanup.cleared + ownerSessionCleanup.cleared + ownerLegacyCleanup.cleared + runtimeCleanup2.cleared;
+        const hadFailure = legacyCleanup.hadFailure || sessionCleanup.hadFailure || workingDirectoryLocalCleanup.hadFailure || convergedCleanup2.hadFailure || completedSessionCleanup.hadFailure || ownerSessionCleanup.hadFailure || ownerLegacyCleanup.hadFailure || runtimeCleanup2.hadFailure;
+        if (!ownerSessionId && clearedStateOrArtifacts === 0 && !hadFailure) {
+          return {
+            content: [{
+              type: "text",
+              text: formatStateClearNoopMessage(mode, root, sessionId)
+            }]
+          };
+        }
         return {
           content: [{
             type: "text",
-            text: `${legacyCleanup.hadFailure || sessionCleanup.hadFailure || completedSessionCleanup.hadFailure || ownerSessionCleanup.hadFailure || ownerLegacyCleanup.hadFailure || runtimeCleanup2.hadFailure ? "Warning: Some files could not be removed" : "Successfully cleared state"} for mode: ${mode} in session: ${sessionId}${ghostNote}${runtimeCleanupNote}`
+            text: `${hadFailure ? "Warning: Some files could not be removed" : "Successfully cleared state"} for mode: ${mode} in session: ${sessionId}${ghostNote}${runtimeCleanupNote}`
           }]
         };
       }
@@ -23603,6 +24094,11 @@ var stateClearTool = {
       if (extraLegacyCleanup.hadFailure) {
         errors.push("legacy path");
       }
+      const convergedCleanup = clearConvergedStateCandidates(mode, root);
+      clearedCount += convergedCleanup.cleared;
+      if (convergedCleanup.hadFailure) {
+        errors.push("converged paths");
+      }
       clearedCount += runtimeCleanup.cleared;
       if (runtimeCleanup.hadFailure) {
         errors.push("runtime artifacts");
@@ -23645,7 +24141,7 @@ var stateClearTool = {
         return {
           content: [{
             type: "text",
-            text: `No state found to clear for mode: ${mode}`
+            text: formatStateClearNoopMessage(mode, root)
           }]
         };
       }
@@ -23685,17 +24181,20 @@ var stateClearTool = {
 };
 var stateListActiveTool = {
   name: "state_list_active",
-  description: "List all currently active modes. Returns which modes have active state files.",
+  description: "List all currently active modes. By default, scopes to the current session (OMC_SESSION_ID). Pass all:true to list active modes across all sessions.",
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   schema: {
     workingDirectory: external_exports.string().optional().describe("Working directory (defaults to cwd)"),
-    session_id: external_exports.string().optional().describe("Session ID for session-scoped state isolation. When provided, the tool operates only within that session. When omitted, the tool aggregates legacy state plus all session-scoped state (may include other sessions).")
+    session_id: external_exports.string().optional().describe("Explicit session ID to scope the listing. Overrides OMC_SESSION_ID when provided."),
+    all: external_exports.boolean().optional().describe("When true, list active modes across all sessions (legacy + every session-scoped dir). Overrides the default current-session scope.")
   },
   handler: async (args) => {
-    const { workingDirectory, session_id } = args;
+    const { workingDirectory, session_id, all } = args;
     try {
       const root = validateWorkingDirectory(workingDirectory);
-      const sessionId = session_id;
+      const explicitSessionId = session_id;
+      const showAll = all === true;
+      const sessionId = explicitSessionId ?? (showAll ? void 0 : resolveSessionId({ context: "cli" }));
       if (sessionId) {
         validateSessionId(sessionId);
         const activeModes = [...getActiveModes(root, sessionId)];
@@ -23710,6 +24209,11 @@ var stateListActiveTool = {
               }
             }
           } catch {
+          }
+        }
+        for (const mode of CONVERGED_STATE_PATH_MODES) {
+          if (!activeModes.includes(mode) && hasActiveConvergedState(mode, root, sessionId)) {
+            activeModes.push(mode);
           }
         }
         if (activeModes.length === 0) {
@@ -23745,6 +24249,11 @@ ${modeList}`
             }
           } catch {
           }
+        }
+      }
+      for (const mode of CONVERGED_STATE_PATH_MODES) {
+        if (!legacyActiveModes.includes(mode) && hasActiveConvergedState(mode, root)) {
+          legacyActiveModes.push(mode);
         }
       }
       for (const mode of legacyActiveModes) {
@@ -24790,8 +25299,8 @@ var import_path18 = require("path");
 
 // src/hooks/rules-injector/constants.ts
 var import_path17 = require("path");
-var import_os4 = require("os");
-var OMC_STORAGE_DIR = (0, import_path17.join)((0, import_os4.homedir)(), ".omc");
+var import_os5 = require("os");
+var OMC_STORAGE_DIR = (0, import_path17.join)((0, import_os5.homedir)(), ".omc");
 var RULES_INJECTOR_STORAGE = (0, import_path17.join)(OMC_STORAGE_DIR, "rules-injector");
 
 // src/hooks/project-memory/storage.ts
@@ -24805,6 +25314,14 @@ var CACHE_EXPIRY_MS = 24 * 60 * 60 * 1e3;
 function getMemoryPath(projectRoot) {
   return getWorktreeProjectMemoryPath(projectRoot);
 }
+function normalizeProjectMemory(memory) {
+  return {
+    ...memory,
+    customNotes: Array.isArray(memory.customNotes) ? memory.customNotes : [],
+    userDirectives: Array.isArray(memory.userDirectives) ? memory.userDirectives : [],
+    hotPaths: Array.isArray(memory.hotPaths) ? memory.hotPaths : []
+  };
+}
 async function loadProjectMemory(projectRoot) {
   const memoryPath = getMemoryPath(projectRoot);
   try {
@@ -24813,7 +25330,7 @@ async function loadProjectMemory(projectRoot) {
     if (!memory.version || !memory.projectRoot || !memory.lastScanned) {
       return null;
     }
-    return memory;
+    return normalizeProjectMemory(memory);
   } catch (_error) {
     return null;
   }
@@ -24850,22 +25367,23 @@ var import_path22 = __toESM(require("path"), 1);
 
 // src/hooks/project-memory/directive-detector.ts
 function addDirective(directives, newDirective) {
-  const isDuplicate = directives.some(
+  const directiveList = Array.isArray(directives) ? directives : [];
+  const isDuplicate = directiveList.some(
     (d) => d.directive.toLowerCase() === newDirective.directive.toLowerCase()
   );
   if (!isDuplicate) {
-    directives.push(newDirective);
-    if (directives.length > 20) {
-      directives.sort((a, b) => {
+    directiveList.push(newDirective);
+    if (directiveList.length > 20) {
+      directiveList.sort((a, b) => {
         if (a.priority !== b.priority) {
           return a.priority === "high" ? -1 : 1;
         }
         return b.timestamp - a.timestamp;
       });
-      directives.splice(20);
+      directiveList.splice(20);
     }
   }
-  return directives;
+  return directiveList;
 }
 
 // src/hooks/project-memory/learner.ts
@@ -24890,6 +25408,7 @@ async function addCustomNote(projectRoot, category, content) {
         if (!memory) {
           return;
         }
+        memory.customNotes = Array.isArray(memory.customNotes) ? memory.customNotes : [];
         memory.customNotes.push({
           timestamp: Date.now(),
           source: "manual",
@@ -25451,9 +25970,6 @@ function parseSinceSpec(since) {
   const parsed = Date.parse(trimmed);
   return Number.isNaN(parsed) ? void 0 : parsed;
 }
-function encodeProjectPath(projectPath) {
-  return projectPath.replace(/[/\\.]/g, "-");
-}
 function getMainRepoRoot(projectRoot) {
   try {
     const gitCommonDir = (0, import_child_process10.execSync)("git rev-parse --git-common-dir", {
@@ -25880,7 +26396,7 @@ var sessionSearchTool = {
 // src/tools/trace-tools.ts
 var REPLAY_PREFIX2 = "agent-replay-";
 function findLatestSessionId(directory) {
-  const stateDir = (0, import_path27.join)(directory, ".omc", "state");
+  const stateDir = (0, import_path27.join)(getOmcRoot(directory), "state");
   try {
     const files = (0, import_fs20.readdirSync)(stateDir).filter((f) => f.startsWith(REPLAY_PREFIX2) && f.endsWith(".jsonl")).map((f) => ({
       name: f,
@@ -26685,6 +27201,7 @@ var TOOL_CATEGORIES = {
   INTEROP: "interop",
   CODEX: "codex",
   GEMINI: "gemini",
+  ANTIGRAVITY: "antigravity",
   SHARED_MEMORY: "shared-memory",
   DEEPINIT: "deepinit",
   WIKI: "wiki"
@@ -27864,7 +28381,7 @@ var wikiTools = [
 
 // src/tools/skills-tools.ts
 var import_path33 = require("path");
-var import_os6 = require("os");
+var import_os7 = require("os");
 
 // src/hooks/learner/loader.ts
 var import_fs24 = require("fs");
@@ -27877,9 +28394,9 @@ var import_path31 = require("path");
 
 // src/hooks/learner/constants.ts
 var import_path30 = require("path");
-var import_os5 = require("os");
+var import_os6 = require("os");
 var USER_SKILLS_DIR = (0, import_path30.join)(getClaudeConfigDir(), "skills", "omc-learned");
-var GLOBAL_SKILLS_DIR = (0, import_path30.join)((0, import_os5.homedir)(), ".omc", "skills");
+var GLOBAL_SKILLS_DIR = (0, import_path30.join)((0, import_os6.homedir)(), ".omc", "skills");
 var PROJECT_SKILLS_SUBDIR = OmcPaths.SKILLS;
 var PROJECT_AGENT_SKILLS_SUBDIR = (0, import_path30.join)(".agents", "skills");
 var MAX_RECURSION_DEPTH = 10;
@@ -28167,7 +28684,7 @@ function loadAllSkills(projectRoot) {
 }
 
 // src/tools/skills-tools.ts
-var ALLOWED_BOUNDARIES = [process.cwd(), (0, import_os6.homedir)()];
+var ALLOWED_BOUNDARIES = [process.cwd(), (0, import_os7.homedir)()];
 function validateProjectRoot(input) {
   const normalized = (0, import_path33.normalize)((0, import_path33.resolve)(input));
   if (input.includes("..")) {

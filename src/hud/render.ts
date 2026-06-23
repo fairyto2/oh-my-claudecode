@@ -7,6 +7,7 @@
 import type { HudRenderContext, HudConfig, LayoutConfig } from "./types.js";
 import { DEFAULT_HUD_CONFIG, DEFAULT_ELEMENT_ORDER, DEFAULT_HUD_LABELS } from "./types.js";
 import { bold, dim } from "./colors.js";
+import { isRuntimePackageLocal } from "../lib/version.js";
 import { stringWidth, getCharWidth } from "../utils/string-width.js";
 import { renderRalph } from "./elements/ralph.js";
 import {
@@ -22,6 +23,7 @@ import {
   renderRateLimits,
   renderRateLimitsWithBar,
   renderRateLimitsError,
+  renderApiKeyUsageHint,
   renderCustomBuckets,
 } from "./elements/limits.js";
 import { renderPermission } from "./elements/permission.js";
@@ -34,10 +36,14 @@ import { renderAutopilot } from "./elements/autopilot.js";
 import { renderCwd } from "./elements/cwd.js";
 import { renderHostname } from "./elements/hostname.js";
 import { renderGitRepo, renderGitBranch, renderGitStatus } from "./elements/git.js";
+import { renderMultiRepo } from "./elements/multi-repo.js";
 import { renderModel } from "./elements/model.js";
 import { renderApiKeySource } from "./elements/api-key-source.js";
 import { renderCallCounts } from "./elements/call-counts.js";
-import { renderContextLimitWarning } from "./elements/context-warning.js";
+import {
+  renderContextLimitWarning,
+  renderPayloadLimitWarning,
+} from "./elements/context-warning.js";
 import { renderMissionBoard } from "./mission-board.js";
 import { renderSessionSummary } from "./elements/session-summary.js";
 import { renderLastTool } from "./elements/last-tool.js";
@@ -252,25 +258,40 @@ export async function render(
     if (cwdElement) rendered.set("cwd", cwdElement);
   }
 
-  if (enabledElements.gitRepo) {
-    const gitRepoElement = renderGitRepo(context.cwd);
-    if (gitRepoElement) rendered.set("gitRepo", gitRepoElement);
+  // Multi-repo parent dir: replace the per-repo chips with a single
+  // workspace summary. When cwd is itself a git repo, renderMultiRepo
+  // returns null and the normal git elements take over.
+  const multiRepoElement = enabledElements.gitRepo
+    ? renderMultiRepo(context.cwd)
+    : null;
+
+  if (multiRepoElement) {
+    rendered.set("gitRepo", multiRepoElement);
+  } else {
+    if (enabledElements.gitRepo) {
+      const gitRepoElement = renderGitRepo(context.cwd);
+      if (gitRepoElement) rendered.set("gitRepo", gitRepoElement);
+    }
+
+    if (enabledElements.gitBranch) {
+      const gitBranchElement = renderGitBranch(context.cwd);
+      if (gitBranchElement) rendered.set("gitBranch", gitBranchElement);
+    }
+
+    if (enabledElements.gitStatus) {
+      const gitStatusElement = renderGitStatus(context.cwd, hudLabels);
+      if (gitStatusElement) rendered.set("gitStatus", gitStatusElement);
+    }
   }
 
-  if (enabledElements.gitBranch) {
-    const gitBranchElement = renderGitBranch(context.cwd);
-    if (gitBranchElement) rendered.set("gitBranch", gitBranchElement);
-  }
-
-  if (enabledElements.gitStatus) {
-    const gitStatusElement = renderGitStatus(context.cwd, hudLabels);
-    if (gitStatusElement) rendered.set("gitStatus", gitStatusElement);
-  }
-
-  if (enabledElements.model && context.modelName) {
+  const modelSource = enabledElements.modelFormat === 'full'
+    ? context.modelId ?? context.modelName
+    : context.modelName;
+  if (enabledElements.model && modelSource) {
     const modelElement = renderModel(
-      context.modelName,
+      modelSource,
       enabledElements.modelFormat,
+      hudLabels,
     );
     if (modelElement) rendered.set("model", modelElement);
   }
@@ -287,8 +308,11 @@ export async function render(
   // -- main-group elements (default: main statusline) --
 
   if (enabledElements.omcLabel) {
-    const versionTag = context.omcVersion ? `#${context.omcVersion}` : "";
-    if (context.updateAvailable) {
+    const localSuffix = isRuntimePackageLocal() ? "L" : "";
+    const versionTag = context.omcVersion
+      ? `#${context.omcVersion}${localSuffix}`
+      : (localSuffix ? `#${localSuffix}` : "");
+    if (enabledElements.updateNotification !== false && context.updateAvailable) {
       rendered.set(
         "omcLabel",
         bold(`[OMC${versionTag}] -> ${context.updateAvailable} omc update`),
@@ -328,7 +352,16 @@ export async function render(
       if (limits) rendered.set("rateLimits", limits);
     } else {
       const errorIndicator = renderRateLimitsError(context.rateLimitsResult);
-      if (errorIndicator) rendered.set("rateLimits", errorIndicator);
+      if (errorIndicator) {
+        rendered.set("rateLimits", errorIndicator);
+      } else {
+        const hint = renderApiKeyUsageHint(
+          context.rateLimitsResult,
+          context.apiKeyMode ?? false,
+          config.rateLimitsProvider?.type === "custom",
+        );
+        if (hint) rendered.set("rateLimits", hint);
+      }
     }
   }
 
@@ -499,6 +532,9 @@ export async function render(
     config.contextLimitWarning.autoCompact,
   );
   if (ctxWarning) renderedDetail.set("contextWarning", [ctxWarning]);
+
+  const payloadWarning = renderPayloadLimitWarning(context.payloadEstimate);
+  if (payloadWarning) renderedDetail.set("payloadWarning", [payloadWarning]);
 
   if (enabledElements.todos) {
     const todos = renderTodosWithCurrent(context.todos);

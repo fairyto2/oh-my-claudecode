@@ -47,7 +47,7 @@ import {
   clearVerificationState,
   type VerificationState,
 } from '../ralph/index.js';
-import { checkIncompleteTodos, getNextPendingTodo, StopContext, isUserAbort, isContextLimitStop, isRateLimitStop, isExplicitCancelCommand, isAuthenticationError, isScheduledWakeupStop } from '../todo-continuation/index.js';
+import { checkIncompleteTodos, getNextPendingTodo, StopContext, isUserAbort, isContextLimitStop, isRateLimitStop, isExplicitCancelCommand, isAuthenticationError, isScheduledWakeupStop, isOversizeToolResultRedirectStop } from '../todo-continuation/index.js';
 import { TODO_CONTINUATION_PROMPT } from '../../installer/hooks.js';
 import {
   isAutopilotActive
@@ -93,6 +93,20 @@ export interface PersistentModeResult {
 const MAX_TODO_CONTINUATION_ATTEMPTS = 5;
 const CANCEL_SIGNAL_TTL_MS = 30_000;
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+const PENDING_ASYNC_STATE_STALE_MS = 24 * 60 * 60 * 1000;
+const OVERSIZE_TOOL_RESULT_REDIRECT_STOP_MAX = 3;
+const OVERSIZE_TOOL_RESULT_REDIRECT_STOP_TTL_MS = 5 * 60 * 1000;
+const TERMINAL_WORKFLOW_SLOT_MODES = new Set(['autopilot', 'ralph', 'ralplan']);
+const TERMINAL_WORKFLOW_PHASES = new Set([
+  'complete',
+  'completed',
+  'failed',
+  'cancelled',
+  'canceled',
+  'cancel',
+  'done',
+  'stopped',
+]);
 
 /** Track todo-continuation attempts per session to prevent infinite loops */
 const todoContinuationAttempts = new Map<string, number>();
@@ -172,6 +186,159 @@ function isStaleState(state: unknown): boolean {
   }
 
   return Date.now() - mostRecent > STALE_STATE_THRESHOLD_MS;
+}
+
+function parseTimestamp(value: unknown): number | null {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isFreshTimestamp(value: unknown, ttlMs = PENDING_ASYNC_STATE_STALE_MS): boolean {
+  const parsed = parseTimestamp(value);
+  return parsed !== null && Date.now() - parsed <= ttlMs;
+}
+
+function hasPendingBackgroundTask(directory: string, sessionId?: string): boolean {
+  try {
+    const stateRoot = join(getOmcRoot(directory), 'state');
+    const hudPath = sessionId
+      ? join(stateRoot, 'sessions', sessionId, 'hud-state.json')
+      : join(stateRoot, 'hud-state.json');
+    if (!existsSync(hudPath)) return false;
+    const hudState = JSON.parse(readFileSync(hudPath, 'utf-8')) as {
+      backgroundTasks?: Array<{
+        status?: string;
+        startedAt?: string;
+        startTime?: string;
+      }>;
+    };
+    return Boolean(hudState?.backgroundTasks?.some((task) => {
+      if (task.status !== 'running') return false;
+      return isFreshTimestamp(task.startedAt ?? task.startTime);
+    }));
+  } catch {
+    return false;
+  }
+}
+
+function readPendingWakeupState(directory: string, sessionId?: string): Array<Record<string, unknown>> {
+  const stateRoot = join(getOmcRoot(directory), 'state');
+  const dirs = sessionId
+    ? [join(stateRoot, 'sessions', sessionId), stateRoot]
+    : [stateRoot];
+  const fileNames = [
+    'scheduled-wakeup-state.json',
+    'schedule-wakeup-state.json',
+    'wakeup-state.json',
+  ];
+  const states: Array<Record<string, unknown>> = [];
+
+  for (const dir of dirs) {
+    for (const fileName of fileNames) {
+      const filePath = join(dir, fileName);
+      try {
+        if (!existsSync(filePath)) continue;
+        const parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+        if (parsed && typeof parsed === 'object') {
+          states.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return states;
+}
+
+function hasPendingScheduledWakeup(directory: string, sessionId?: string): boolean {
+  const now = Date.now();
+  return readPendingWakeupState(directory, sessionId).some((state) => {
+    const status = typeof state.status === 'string' ? state.status.toLowerCase() : '';
+    if (['completed', 'complete', 'cancelled', 'canceled', 'failed', 'expired'].includes(status)) {
+      return false;
+    }
+
+    const dueAt = parseTimestamp(
+      state.due_at ?? state.wakeup_at ?? state.scheduled_for ?? state.deadline_at ?? state.expires_at,
+    );
+    if (dueAt !== null) {
+      return dueAt > now;
+    }
+
+    if (state.active === true || state.pending === true) {
+      return isFreshTimestamp(state.created_at ?? state.updated_at ?? state.started_at);
+    }
+
+    return false;
+  });
+}
+
+function normalizeWorkflowTerminalPhase(state: Record<string, unknown>): string | null {
+  const raw = state.current_phase ?? state.phase ?? state.status;
+  return typeof raw === 'string' && raw.trim().length > 0
+    ? raw.trim().toLowerCase()
+    : null;
+}
+
+function isTerminalWorkflowModeState(state: Record<string, unknown> | null): boolean {
+  if (!state) return false;
+  if (state.active === false) return true;
+  if (typeof state.completed_at === 'string' && state.completed_at.length > 0) return true;
+  const phase = normalizeWorkflowTerminalPhase(state);
+  return Boolean(phase && TERMINAL_WORKFLOW_PHASES.has(phase));
+}
+
+async function reconcileTerminalWorkflowSlots(
+  workingDir: string,
+  sessionId?: string,
+): Promise<void> {
+  try {
+    const {
+      readSkillActiveStateNormalized,
+      pruneExpiredWorkflowSkillTombstones,
+      markWorkflowSkillCompleted,
+      writeSkillActiveStateCopies,
+    } = await import('../skill-state/index.js');
+
+    const original = readSkillActiveStateNormalized(workingDir, sessionId);
+    let current = pruneExpiredWorkflowSkillTombstones(original);
+    let changed = current !== original;
+
+    for (const [slotName, slot] of Object.entries(current.active_skills)) {
+      if (slot.completed_at || !TERMINAL_WORKFLOW_SLOT_MODES.has(slotName)) {
+        continue;
+      }
+
+      const modeState = readModeState<Record<string, unknown>>(slotName, workingDir, sessionId);
+      if (!isTerminalWorkflowModeState(modeState)) {
+        continue;
+      }
+
+      current = markWorkflowSkillCompleted(current, slotName);
+      changed = true;
+    }
+
+    if (changed) {
+      writeSkillActiveStateCopies(workingDir, current, sessionId);
+    }
+  } catch {
+    // Best-effort reconciliation only. Stop enforcement falls back to the
+    // direct mode-state checks below if the ledger cannot be updated.
+  }
+}
+
+/**
+ * Pending owned async work (background Bash/Task or an armed wakeup) means the
+ * agent is legitimately waiting for an external notification/resume. In that
+ * window persistent modes should not inject a "stalled" reinforcement.
+ */
+export function hasPendingOwnedAsyncWork(directory: string, sessionId?: string): boolean {
+  return hasPendingBackgroundTask(directory, sessionId)
+    || hasPendingScheduledWakeup(directory, sessionId);
 }
 
 /**
@@ -451,6 +618,14 @@ const RALPLAN_TERMINAL_PHASES = new Set([
   'terminated',
   'done',
   'handoff',
+  'pending approval',
+  'pending-approval',
+  'pending_approval',
+  'awaiting approval',
+  'awaiting-approval',
+  'awaiting_approval',
+  'approval-required',
+  'approval_required',
 ]);
 
 /**
@@ -1119,6 +1294,177 @@ function writeStopBreaker(directory: string, name: string, count: number, sessio
 }
 
 // ---------------------------------------------------------------------------
+// Thinking-only streak guard (issue #3280)
+//
+// A persistent mode (ralph/autopilot/team/ralplan/ultrawork/…) re-injects a
+// continuation prompt on every Stop while the mode is active. If the agent
+// answers each continuation with only thinking blocks and never a tool_use,
+// no work happens but tokens keep burning. Bound that failure: count
+// consecutive thinking-only assistant turns and release the stop once the
+// streak hits a conservative threshold. Any tool_use turn resets the streak,
+// and every read/parse path fails open (keep enforcing) so a flaky transcript
+// never short-circuits a healthy persistent mode.
+// ---------------------------------------------------------------------------
+
+const THINKING_ONLY_STREAK_BREAKER = 'thinking-only-streak';
+const THINKING_ONLY_STREAK_MAX = 3;
+const THINKING_ONLY_STREAK_TTL_MS = 5 * 60 * 1000; // 5 min
+const THINKING_ONLY_STREAK_BAILOUT_MESSAGE =
+  `[PERSISTENT MODE PAUSED - NO TOOL PROGRESS] The last ${THINKING_ONLY_STREAK_MAX} assistant turns ` +
+  'produced only thinking with no tool calls, so the persistent-mode stop guard is releasing this ' +
+  'stop to avoid an infinite loop. Resume manually with a concrete next action (run a tool/command) ' +
+  'or /cancel the active mode.';
+
+type ThinkingOnlyClassification = 'tool_use' | 'thinking_only' | 'indeterminate';
+
+/**
+ * Does a user-role transcript record carry a tool_result block? A tool_result
+ * only exists because the assistant invoked a tool earlier in the same turn, so
+ * its presence proves the most recent assistant turn made tool progress.
+ */
+function userRecordHasToolResult(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (block) => (block as { type?: unknown } | null)?.type === 'tool_result',
+  );
+}
+
+/**
+ * Classify the most recent assistant *turn* in a transcript as making tool
+ * progress, being thinking-only, or indeterminate. A turn spans every assistant
+ * record (and interleaved tool_result records) back to the preceding real user
+ * message, so a productive turn whose final record is plain text — tool_use
+ * earlier, trailing text before stop — still classifies as tool_use rather than
+ * leaking through as indeterminate.
+ *
+ * Reads only the bounded transcript tail (never the whole file) and treats any
+ * unreadable/ambiguous shape as indeterminate so callers fail open.
+ */
+function classifyLastAssistantTurn(transcriptPath: string): ThinkingOnlyClassification {
+  let lines: string[];
+  try {
+    lines = readTranscriptTailLines(transcriptPath);
+  } catch {
+    return 'indeterminate';
+  }
+
+  let sawAssistant = false;
+  let hasThinking = false;
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line) continue;
+
+    let parsed: { type?: string; message?: { role?: string; content?: unknown } };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      // Skip non-JSON/truncated lines and keep scanning backward.
+      continue;
+    }
+
+    const role = parsed?.message?.role;
+    const isAssistant = parsed?.type === 'assistant' || role === 'assistant';
+    if (isAssistant) {
+      sawAssistant = true;
+      const content = parsed.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const blockType = (block as { type?: unknown } | null)?.type;
+          if (blockType === 'tool_use') {
+            // Any tool_use anywhere in the most recent turn is real progress.
+            return 'tool_use';
+          }
+          if (blockType === 'thinking' || blockType === 'redacted_thinking') {
+            hasThinking = true;
+          }
+        }
+      }
+      // Non-array (string/missing) content carries no structured block; keep
+      // scanning the rest of the turn rather than bailing out early.
+      continue;
+    }
+
+    const isUser = parsed?.type === 'user' || role === 'user';
+    if (isUser) {
+      // A tool_result confirms the turn invoked a tool, so it made progress.
+      if (userRecordHasToolResult(parsed.message?.content)) {
+        return 'tool_use';
+      }
+      // A real user message marks the start of the most recent assistant turn.
+      break;
+    }
+
+    // Other record types (system/summary/…) are turn-neutral; keep scanning.
+  }
+
+  if (!sawAssistant) return 'indeterminate';
+  return hasThinking ? 'thinking_only' : 'indeterminate';
+}
+
+/**
+ * Bound persistent-mode continuation loops that make no tool progress.
+ *
+ * Only acts when a mode would otherwise block the stop. A tool_use turn resets
+ * the streak; a thinking-only turn increments it and, once it reaches
+ * THINKING_ONLY_STREAK_MAX, releases the stop (and clears the counter) instead
+ * of re-injecting another continuation prompt. Indeterminate/unreadable
+ * transcripts leave the streak untouched and keep the original blocking result.
+ */
+function applyThinkingOnlyStreakGuard(
+  result: PersistentModeResult,
+  workingDir: string,
+  sessionId?: string,
+  stopContext?: StopContext,
+): PersistentModeResult {
+  // Non-blocking results already let the session stop — no loop to bound.
+  if (!result.shouldBlock) return result;
+
+  const transcriptPath = stopContext?.transcript_path ?? stopContext?.transcriptPath;
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    return result; // fail open: cannot classify without a transcript
+  }
+
+  let classification: ThinkingOnlyClassification;
+  try {
+    classification = classifyLastAssistantTurn(transcriptPath);
+  } catch {
+    return result; // fail open on any unexpected read/parse error
+  }
+
+  if (classification === 'tool_use') {
+    // Real progress — reset the streak and keep enforcing.
+    writeStopBreaker(workingDir, THINKING_ONLY_STREAK_BREAKER, 0, sessionId);
+    return result;
+  }
+
+  if (classification === 'indeterminate') {
+    // Cannot confirm a thinking-only stall — keep enforcing, leave streak as is.
+    return result;
+  }
+
+  const streak = readStopBreaker(
+    workingDir,
+    THINKING_ONLY_STREAK_BREAKER,
+    sessionId,
+    THINKING_ONLY_STREAK_TTL_MS,
+  ) + 1;
+
+  if (streak >= THINKING_ONLY_STREAK_MAX) {
+    // Bail out: release the stop and clear the counter for a clean restart.
+    writeStopBreaker(workingDir, THINKING_ONLY_STREAK_BREAKER, 0, sessionId);
+    return {
+      shouldBlock: false,
+      message: THINKING_ONLY_STREAK_BAILOUT_MESSAGE,
+      mode: 'none',
+    };
+  }
+
+  writeStopBreaker(workingDir, THINKING_ONLY_STREAK_BREAKER, streak, sessionId);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Team Pipeline enforcement (standalone team mode)
 // ---------------------------------------------------------------------------
 
@@ -1528,8 +1874,9 @@ async function checkRalplan(
 
 [RALPLAN - CONSENSUS PLANNING | REINFORCEMENT ${breakerCount}/${RALPLAN_STOP_BLOCKER_MAX}]
 
-The ralplan consensus workflow is active. Continue the Planner/Architect/Critic loop.
-Do not stop until consensus is reached or the workflow completes.
+The ralplan consensus workflow is active. Continue the Planner/Architect/Critic planning loop only.
+Ralplan is read-only/planning mode: do not implement, invoke execution skills, edit source, commit, push, or open PRs from this continuation.
+When consensus is reached, stop at a pending-approval handoff and require explicit user approval before execution.
 When done, run \`/oh-my-claudecode:cancel\` to cleanly exit.
 
 </ralplan-continuation>
@@ -1692,10 +2039,30 @@ ${TODO_CONTINUATION_PROMPT}
 }
 
 /**
- * Main persistent mode checker
- * Checks all persistent modes in priority order and returns appropriate action
+ * Main persistent mode checker.
+ * Resolves which mode (if any) should block, then applies the thinking-only
+ * streak guard so an active mode cannot loop forever re-injecting continuation
+ * prompts while the agent only emits thinking blocks and never tool_use (#3280).
  */
 export async function checkPersistentModes(
+  sessionId?: string,
+  directory?: string,
+  stopContext?: StopContext  // NEW: from todo-continuation types
+): Promise<PersistentModeResult> {
+  const result = await resolvePersistentModeBlock(sessionId, directory, stopContext);
+  return applyThinkingOnlyStreakGuard(
+    result,
+    resolveToWorktreeRoot(directory),
+    sessionId,
+    stopContext,
+  );
+}
+
+/**
+ * Resolve which persistent mode (if any) should block this stop event.
+ * Checks all persistent modes in priority order and returns appropriate action.
+ */
+async function resolvePersistentModeBlock(
   sessionId?: string,
   directory?: string,
   stopContext?: StopContext  // NEW: from todo-continuation types
@@ -1721,21 +2088,12 @@ export async function checkPersistentModes(
     return { shouldBlock: false, message: '', mode: 'none' };
   }
 
-  // Best-effort: prune expired tombstones so stale completion markers do not
-  // linger past their TTL and mask a fresh invocation. Never let a prune
-  // failure interfere with stop enforcement.
-  try {
-    const { readSkillActiveStateNormalized, pruneExpiredWorkflowSkillTombstones, writeSkillActiveStateCopies } =
-      await import('../skill-state/index.js');
-    const current = readSkillActiveStateNormalized(workingDir, sessionId);
-    const pruned = pruneExpiredWorkflowSkillTombstones(current);
-    if (pruned !== current) {
-      writeSkillActiveStateCopies(workingDir, pruned, sessionId);
-    }
-  } catch {
-    // Skill-state module unavailable or ledger unreadable — continue with
-    // legacy priority enforcement.
-  }
+  // Best-effort: keep the workflow-slot ledger aligned with terminal mode
+  // state before using it for stop-gating authority. This both prunes old
+  // tombstones and tombstones live slots whose autopilot/Ralph/ralplan mode
+  // state already reached a terminal/inactive state through a path other than
+  // the Skill PostToolUse completion hook.
+  await reconcileTerminalWorkflowSlots(workingDir, sessionId);
 
   // CRITICAL: Never block context-limit/critical-context stops.
   // Blocking these causes a deadlock where Claude Code cannot compact or exit.
@@ -1810,6 +2168,44 @@ export async function checkPersistentModes(
   // inject `/cancel` guidance from stale state and cause the scheduled turn to
   // cancel itself before the real work runs.
   if (isScheduledWakeupStop(stopContext)) {
+    return {
+      shouldBlock: false,
+      message: '',
+      mode: 'none'
+    };
+  }
+
+  // Oversized tool outputs can cause Claude Code to end the current turn after
+  // redirecting the payload to a `tool-results/*.txt` file pointer. That stop is
+  // not a real idle/stall signal: injecting a visible Ralph/Ultrawork/todo
+  // continuation banner immediately after the redirect spams the transcript
+  // while the agent is still mid-task. Suppress only a small consecutive window
+  // of such redirects; if redirects keep repeating, fall through to the normal
+  // persistence checks so genuine stalls still get re-enforced.
+  if (isOversizeToolResultRedirectStop(stopContext)) {
+    const redirectStopCount = readStopBreaker(
+      workingDir,
+      'oversize-tool-result-redirect',
+      sessionId,
+      OVERSIZE_TOOL_RESULT_REDIRECT_STOP_TTL_MS,
+    ) + 1;
+    writeStopBreaker(workingDir, 'oversize-tool-result-redirect', redirectStopCount, sessionId);
+
+    if (redirectStopCount <= OVERSIZE_TOOL_RESULT_REDIRECT_STOP_MAX) {
+      return {
+        shouldBlock: false,
+        message: '',
+        mode: 'none'
+      };
+    }
+  } else {
+    writeStopBreaker(workingDir, 'oversize-tool-result-redirect', 0, sessionId);
+  }
+
+  // If this session owns pending async work, quiescence is intentional: Claude
+  // Code will notify on background completion or resume via ScheduleWakeup.
+  // Do not convert that waiting window into a Ralph/persistent-mode stall loop.
+  if (hasPendingOwnedAsyncWork(workingDir, sessionId)) {
     return {
       shouldBlock: false,
       message: '',

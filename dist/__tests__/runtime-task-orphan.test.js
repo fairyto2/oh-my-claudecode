@@ -20,6 +20,8 @@ vi.mock('../team/model-contract.js', () => ({
     isPromptModeAgent: vi.fn(() => false),
     getPromptModeArgs: vi.fn(() => []),
     resolveClaudeWorkerModel: vi.fn(() => undefined),
+    assertHeadlessSupported: vi.fn(() => { }),
+    isHeadlessSupportedOnPlatform: vi.fn(() => true),
 }));
 vi.mock('../team/tmux-session.js', () => ({
     createTeamSession: vi.fn(),
@@ -29,6 +31,7 @@ vi.mock('../team/tmux-session.js', () => ({
     killTeamSession: vi.fn(),
     resolveSplitPaneWorkerPaneIds: vi.fn(() => []),
     waitForPaneReady: vi.fn(() => Promise.resolve(true)),
+    splitTeamWorkerPane: vi.fn(() => Promise.resolve(null)),
 }));
 vi.mock('../team/worker-bootstrap.js', () => ({
     composeInitialInbox: vi.fn(),

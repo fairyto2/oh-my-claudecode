@@ -7,7 +7,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 vi.mock('child_process', async (importOriginal) => {
@@ -248,7 +248,7 @@ describe('runClaude outside-tmux — mouse scrolling (issue #890)', () => {
     it('uses session-targeted mouse option instead of global (-t sessionName, not -g)', () => {
         runClaude('/tmp', [], 'sid');
         const tmuxCalls = vi.mocked(tmuxExec).mock.calls;
-        const tmuxCall = tmuxCalls.find(([args]) => args[0] === 'set-option');
+        const tmuxCall = tmuxCalls.find(([args]) => args[0] === 'set-option' && args.includes('mouse'));
         expect(tmuxCall).toBeDefined();
         const tmuxArgs = tmuxCall[0];
         expect(tmuxArgs).toContain('-t');
@@ -270,11 +270,23 @@ describe('runClaude outside-tmux — mouse scrolling (issue #890)', () => {
     it('places mouse mode setup before attach-session', () => {
         runClaude('/tmp', [], 'sid');
         const tmuxCalls = vi.mocked(tmuxExec).mock.calls.map(([args]) => args);
-        const mouseIdx = tmuxCalls.findIndex((args) => args[0] === 'set-option');
+        const mouseIdx = tmuxCalls.findIndex((args) => args[0] === 'set-option' && args.includes('mouse'));
         const attachIdx = tmuxCalls.findIndex((args) => args[0] === 'attach-session');
         expect(mouseIdx).toBeGreaterThanOrEqual(0);
         expect(attachIdx).toBeGreaterThanOrEqual(0);
         expect(mouseIdx).toBeLessThan(attachIdx);
+    });
+    it('applies session-scoped OSC 52 clipboard options before attach-session', () => {
+        runClaude('/tmp', [], 'sid');
+        const tmuxCalls = vi.mocked(tmuxExec).mock.calls.map(([args]) => args);
+        expect(tmuxCalls).toContainEqual(['set-option', '-t', 'test-session', 'set-clipboard', 'on']);
+        expect(tmuxCalls).toContainEqual(['show-options', '-t', 'test-session', '-v', 'terminal-features']);
+        expect(tmuxCalls).toContainEqual(['set-option', '-at', 'test-session', 'terminal-features', ',*:clipboard']);
+        expect(tmuxCalls.find((args) => args.includes('set-clipboard'))).not.toContain('-g');
+        const clipboardIdx = tmuxCalls.findIndex((args) => args.includes('set-clipboard'));
+        const attachIdx = tmuxCalls.findIndex((args) => args[0] === 'attach-session');
+        expect(clipboardIdx).toBeGreaterThanOrEqual(0);
+        expect(attachIdx).toBeGreaterThan(clipboardIdx);
     });
     it('preserves a valid detached session when attach-session is interrupted', () => {
         vi.mocked(tmuxExec).mockImplementation((args) => {
@@ -287,6 +299,9 @@ describe('runClaude outside-tmux — mouse scrolling (issue #890)', () => {
         const tmuxCalls = vi.mocked(tmuxExec).mock.calls.map(([args]) => args);
         expect(tmuxCalls.map((args) => args[0])).toEqual([
             'new-session',
+            'set-option',
+            'show-options',
+            'set-option',
             'set-option',
             'attach-session',
             'has-session',
@@ -325,8 +340,8 @@ describe('runClaude inside-tmux — mouse configuration (issue #890)', () => {
         runClaude('/tmp', [], 'sid');
         // tmuxExec should have been called for mouse config
         const tmuxCalls = vi.mocked(tmuxExec).mock.calls;
-        expect(tmuxCalls.length).toBeGreaterThanOrEqual(1);
-        expect(tmuxCalls[0][0]).toEqual(['set-option', 'mouse', 'on']);
+        const mouseCall = tmuxCalls.find(([args]) => args[0] === 'set-option' && args.includes('mouse'));
+        expect(mouseCall?.[0]).toEqual(['set-option', 'mouse', 'on']);
         // execFileSync should have been called for claude
         const claudeCalls = vi.mocked(execFileSync).mock.calls;
         expect(claudeCalls.find(([cmd]) => cmd === 'claude')).toBeDefined();
@@ -791,16 +806,73 @@ describe('prepareOmcLaunchConfigDir / launchCommand OMC companion loading', () =
         expect(runtimeSettings.mcpServers?.team).toBeUndefined();
         expect(runtimeSettings.mcpServers?.exa).toBeDefined();
     });
-    it('mirrors keybindings.json and rules/ into the runtime config dir', () => {
+    it('mirrors keybindings.json, rules/, and themes/ into the runtime config dir', () => {
         const configDir = join(tempRoot, '.claude');
         mkdirSync(join(configDir, 'rules'), { recursive: true });
+        mkdirSync(join(configDir, 'themes'), { recursive: true });
         writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
         writeFileSync(join(configDir, 'keybindings.json'), '{"bindings":[]}');
         writeFileSync(join(configDir, 'rules', 'my-rule.md'), '# Rule');
+        writeFileSync(join(configDir, 'themes', 'custom-theme.json'), '{"name":"custom"}');
         const runtimeDir = prepareOmcLaunchConfigDir(configDir);
         expect(runtimeDir).not.toBe(configDir);
         expect(existsSync(join(runtimeDir, 'keybindings.json'))).toBe(true);
         expect(existsSync(join(runtimeDir, 'rules'))).toBe(true);
+        expect(existsSync(join(runtimeDir, 'themes'))).toBe(true);
+        expect(readFileSync(join(runtimeDir, 'themes', 'custom-theme.json'), 'utf-8')).toBe('{"name":"custom"}');
+    });
+    it('mirrors Linux credential file as a symlink without copying credential content', () => {
+        const configDir = join(tempRoot, '.claude');
+        mkdirSync(configDir, { recursive: true });
+        const credentialsPath = join(configDir, '.credentials.json');
+        const credentialContent = '{"accessToken":"test-only-token"}';
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
+        writeFileSync(credentialsPath, credentialContent);
+        try {
+            const runtimeDir = prepareOmcLaunchConfigDir(configDir);
+            const runtimeCredentialsPath = join(runtimeDir, '.credentials.json');
+            expect(existsSync(runtimeCredentialsPath)).toBe(true);
+            expect(lstatSync(runtimeCredentialsPath).isSymbolicLink()).toBe(true);
+            expect(readlinkSync(runtimeCredentialsPath)).toBe(credentialsPath);
+            const consoleOutput = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls].flat().join('\n');
+            expect(consoleOutput).not.toContain(credentialContent);
+        }
+        finally {
+            logSpy.mockRestore();
+            warnSpy.mockRestore();
+            errorSpy.mockRestore();
+        }
+    });
+    it('does not copy credential content when credential symlink creation fails', async () => {
+        vi.resetModules();
+        const actualFs = await vi.importActual('node:fs');
+        const copyFileSyncSpy = vi.fn(actualFs.copyFileSync);
+        vi.doMock('fs', () => ({
+            ...actualFs,
+            copyFileSync: copyFileSyncSpy,
+            symlinkSync: vi.fn(() => {
+                throw new Error('symlink unavailable');
+            }),
+        }));
+        try {
+            const { prepareOmcLaunchConfigDir: prepareWithFailedSymlink } = await import('../launch.js');
+            const configDir = join(tempRoot, '.claude');
+            mkdirSync(configDir, { recursive: true });
+            const credentialsPath = join(configDir, '.credentials.json');
+            writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
+            writeFileSync(credentialsPath, '{"accessToken":"test-only-token"}');
+            const runtimeDir = prepareWithFailedSymlink(configDir);
+            const runtimeCredentialsPath = join(runtimeDir, '.credentials.json');
+            expect(existsSync(runtimeCredentialsPath)).toBe(false);
+            expect(copyFileSyncSpy).not.toHaveBeenCalledWith(credentialsPath, runtimeCredentialsPath);
+        }
+        finally {
+            vi.doUnmock('fs');
+            vi.resetModules();
+        }
     });
     it('preserves runtime .claude.json across runtime config dir rebuilds', () => {
         const configDir = join(tempRoot, '.claude');
@@ -811,6 +883,77 @@ describe('prepareOmcLaunchConfigDir / launchCommand OMC companion loading', () =
         const rebuiltRuntimeDir = prepareOmcLaunchConfigDir(configDir);
         expect(rebuiltRuntimeDir).toBe(runtimeDir);
         expect(readFileSync(join(rebuiltRuntimeDir, '.claude.json'), 'utf-8')).toBe('{"session":"keep-me"}');
+    });
+    it('seeds missing runtime .claude.json mcpServers from source .claude.json', () => {
+        const configDir = join(tempRoot, '.claude');
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
+        writeFileSync(join(tempRoot, '.claude.json'), JSON.stringify({
+            mcpServers: {
+                github: { command: 'node', args: ['github-mcp.js'] },
+            },
+            sourceOnly: true,
+        }, null, 2));
+        const runtimeDir = prepareOmcLaunchConfigDir(configDir);
+        const runtimeClaudeJson = JSON.parse(readFileSync(join(runtimeDir, '.claude.json'), 'utf-8'));
+        expect(runtimeClaudeJson).toEqual({
+            mcpServers: {
+                github: { command: 'node', args: ['github-mcp.js'] },
+            },
+        });
+    });
+    it('refreshes runtime mcpServers from source while preserving runtime metadata', () => {
+        const configDir = join(tempRoot, '.claude');
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
+        writeFileSync(join(tempRoot, '.claude.json'), JSON.stringify({
+            mcpServers: {
+                exa: { command: 'node', args: ['old-exa.js'] },
+            },
+        }, null, 2));
+        const runtimeDir = prepareOmcLaunchConfigDir(configDir);
+        writeFileSync(join(runtimeDir, '.claude.json'), JSON.stringify({
+            session: 'keep-me',
+            projects: { '/repo': { history: ['keep'] } },
+            mcpServers: {
+                exa: { command: 'node', args: ['stale-exa.js'] },
+            },
+        }, null, 2));
+        writeFileSync(join(tempRoot, '.claude.json'), JSON.stringify({
+            mcpServers: {
+                exa: { command: 'node', args: ['new-exa.js'] },
+                playwright: { command: 'npx', args: ['@playwright/mcp'] },
+            },
+            sourceOnly: 'not copied',
+        }, null, 2));
+        const rebuiltRuntimeDir = prepareOmcLaunchConfigDir(configDir);
+        const runtimeClaudeJson = JSON.parse(readFileSync(join(rebuiltRuntimeDir, '.claude.json'), 'utf-8'));
+        expect(runtimeClaudeJson).toEqual({
+            session: 'keep-me',
+            projects: { '/repo': { history: ['keep'] } },
+            mcpServers: {
+                exa: { command: 'node', args: ['new-exa.js'] },
+                playwright: { command: 'npx', args: ['@playwright/mcp'] },
+            },
+        });
+    });
+    it('preserves runtime .claude.json when source .claude.json is absent, invalid, or has no mcpServers', () => {
+        const configDir = join(tempRoot, '.claude');
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(join(configDir, 'CLAUDE-omc.md'), '<!-- OMC:START -->\n# OMC\n<!-- OMC:END -->\n');
+        const runtimeDir = prepareOmcLaunchConfigDir(configDir);
+        const runtimeClaudeJsonPath = join(runtimeDir, '.claude.json');
+        writeFileSync(runtimeClaudeJsonPath, '{"session":"keep-absent"}');
+        prepareOmcLaunchConfigDir(configDir);
+        expect(readFileSync(runtimeClaudeJsonPath, 'utf-8')).toBe('{"session":"keep-absent"}');
+        writeFileSync(join(tempRoot, '.claude.json'), '{not json');
+        writeFileSync(runtimeClaudeJsonPath, '{"session":"keep-invalid"}');
+        prepareOmcLaunchConfigDir(configDir);
+        expect(readFileSync(runtimeClaudeJsonPath, 'utf-8')).toBe('{"session":"keep-invalid"}');
+        writeFileSync(join(tempRoot, '.claude.json'), JSON.stringify({ projects: {} }, null, 2));
+        writeFileSync(runtimeClaudeJsonPath, '{"session":"keep-no-mcp"}');
+        prepareOmcLaunchConfigDir(configDir);
+        expect(readFileSync(runtimeClaudeJsonPath, 'utf-8')).toBe('{"session":"keep-no-mcp"}');
     });
     it('removes non-mirrored runtime junk across runtime config dir rebuilds', () => {
         const configDir = join(tempRoot, '.claude');

@@ -8,6 +8,8 @@ import {
   parseCliOutput,
   isPromptModeAgent,
   getPromptModeArgs,
+  isHeadlessSupportedOnPlatform,
+  validateCliAvailable,
   isCliAvailable,
   shouldLoadShellRc,
   resolveCliBinaryPath,
@@ -112,6 +114,38 @@ describe('model-contract', () => {
       expect(prefixes).toContain('/usr/local/bin');
       expect(prefixes).toContain('/usr/bin');
     });
+
+    it('isTrustedPrefix enforces directory boundaries (no sibling-prefix bypass)', () => {
+      const origHome = process.env.HOME;
+      process.env.HOME = '/home/tester';
+      try {
+        const { isTrustedPrefix } = _testInternals;
+        // exact trusted dir + true descendants are trusted
+        expect(isTrustedPrefix('/usr/bin')).toBe(true);
+        expect(isTrustedPrefix('/usr/bin/codex')).toBe(true);
+        expect(isTrustedPrefix('/usr/local/bin/claude')).toBe(true);
+        expect(isTrustedPrefix('/opt/homebrew/bin/gemini')).toBe(true);
+        expect(isTrustedPrefix('/home/tester/.local/bin/cli')).toBe(true);
+        // siblings whose name merely begins with a trusted prefix are NOT trusted
+        expect(isTrustedPrefix('/usr/bin-malicious/cli')).toBe(false);
+        expect(isTrustedPrefix('/home/tester/.local/bin-evil/cli')).toBe(false);
+        expect(isTrustedPrefix('/opt/homebrew-evil/x')).toBe(false);
+        expect(isTrustedPrefix('/home/tester/Downloads/cli')).toBe(false);
+        // custom trusted dirs (OMC_TRUSTED_CLI_DIRS) get the same boundary check
+        const origCustom = process.env.OMC_TRUSTED_CLI_DIRS;
+        process.env.OMC_TRUSTED_CLI_DIRS = '/opt/mybins';
+        try {
+          expect(isTrustedPrefix('/opt/mybins/grok')).toBe(true);
+          expect(isTrustedPrefix('/opt/mybins-evil/grok')).toBe(false);
+        } finally {
+          if (origCustom === undefined) delete process.env.OMC_TRUSTED_CLI_DIRS;
+          else process.env.OMC_TRUSTED_CLI_DIRS = origCustom;
+        }
+      } finally {
+        if (origHome === undefined) delete process.env.HOME;
+        else process.env.HOME = origHome;
+      }
+    });
   });
   describe('getContract', () => {
     it('returns contract for claude', () => {
@@ -129,8 +163,64 @@ describe('model-contract', () => {
       expect(c.agentType).toBe('gemini');
       expect(c.binary).toBe('gemini');
     });
+    it('returns contract for grok', () => {
+      const c = getContract('grok');
+      expect(c.agentType).toBe('grok');
+      expect(c.binary).toBe('grok');
+      expect(c.supportsPromptMode).toBe(true);
+    });
+    it('returns contract for antigravity', () => {
+      const c = getContract('antigravity');
+      expect(c.agentType).toBe('antigravity');
+      expect(c.binary).toBe('agy');
+      expect(c.supportsPromptMode).toBe(true);
+      expect(c.promptModeFlag).toBe('-p');
+      // Points to official install instructions, not a raw pipe-to-shell command.
+      expect(c.installInstructions).toContain('antigravity.google');
+      expect(c.installInstructions).not.toContain('| bash');
+    });
     it('throws for unknown agent type', () => {
       expect(() => getContract('unknown' as any)).toThrow('Unknown agent type');
+    });
+
+    describe('antigravity Windows headless guard (omc team)', () => {
+      it('reports antigravity headless unsupported on win32, supported elsewhere', () => {
+        expect(isHeadlessSupportedOnPlatform('antigravity', 'win32')).toBe(false);
+        expect(isHeadlessSupportedOnPlatform('antigravity', 'darwin')).toBe(true);
+        expect(isHeadlessSupportedOnPlatform('antigravity', 'linux')).toBe(true);
+        // Other prompt-mode providers stay supported on Windows.
+        expect(isHeadlessSupportedOnPlatform('gemini', 'win32')).toBe(true);
+        expect(isHeadlessSupportedOnPlatform('grok', 'win32')).toBe(true);
+      });
+
+      it('getPromptModeArgs throws for an antigravity team worker on Windows', () => {
+        const restore = setProcessPlatform('win32');
+        try {
+          expect(() => getPromptModeArgs('antigravity', '/path/to/inbox.md')).toThrow(/not supported on Windows/);
+          // Still works for gemini on Windows (uses its own stdin-safe handling elsewhere).
+          expect(getPromptModeArgs('gemini', '/path/to/inbox.md')).toEqual(['-p', '/path/to/inbox.md']);
+        } finally {
+          restore();
+        }
+      });
+
+      it('getPromptModeArgs builds antigravity args normally on non-Windows', () => {
+        const restore = setProcessPlatform('darwin');
+        try {
+          expect(getPromptModeArgs('antigravity', '/path/to/inbox.md')).toEqual(['-p', '/path/to/inbox.md']);
+        } finally {
+          restore();
+        }
+      });
+
+      it('validateCliAvailable refuses antigravity on Windows with a clear message', () => {
+        const restore = setProcessPlatform('win32');
+        try {
+          expect(() => validateCliAvailable('antigravity')).toThrow(/not supported on Windows/);
+        } finally {
+          restore();
+        }
+      });
     });
 
     it('blocks codex when external LLM is disabled', async () => {
@@ -158,6 +248,24 @@ describe('model-contract', () => {
         const { clearSecurityConfigCache } = await import('../../lib/security-config.js');
         clearSecurityConfigCache();
         expect(() => getContract('gemini')).toThrow('blocked by security policy');
+      } finally {
+        if (origSecurity === undefined) {
+          delete process.env.OMC_SECURITY;
+        } else {
+          process.env.OMC_SECURITY = origSecurity;
+        }
+        const { clearSecurityConfigCache } = await import('../../lib/security-config.js');
+        clearSecurityConfigCache();
+      }
+    });
+
+    it('blocks grok when external LLM is disabled', async () => {
+      const origSecurity = process.env.OMC_SECURITY;
+      process.env.OMC_SECURITY = 'strict';
+      try {
+        const { clearSecurityConfigCache } = await import('../../lib/security-config.js');
+        clearSecurityConfigCache();
+        expect(() => getContract('grok')).toThrow('blocked by security policy');
       } finally {
         if (origSecurity === undefined) {
           delete process.env.OMC_SECURITY;
@@ -235,6 +343,32 @@ describe('model-contract', () => {
       expect(args).toContain('--approval-mode');
       expect(args).toContain('yolo');
       expect(args).not.toContain('-p');
+    });
+    it('antigravity leads with --dangerously-skip-permissions (no --print; -p is appended later by getPromptModeArgs)', () => {
+      const noModel = buildLaunchArgs('antigravity', { teamName: 't', workerName: 'w', cwd: '/tmp' });
+      expect(noModel).toEqual(['--dangerously-skip-permissions']);
+      expect(noModel).not.toContain('--model');
+      // -p is NOT in buildLaunchArgs: agy's -p takes the prompt as its value and
+      // is appended (with the instruction) by getPromptModeArgs.
+      expect(noModel).not.toContain('-p');
+      expect(noModel).not.toContain('--print');
+
+      const withModel = buildLaunchArgs('antigravity', { teamName: 't', workerName: 'w', cwd: '/tmp', model: 'Gemini 3.1 Pro (High)' });
+      expect(withModel).toEqual(['--dangerously-skip-permissions', '--model', 'Gemini 3.1 Pro (High)']);
+      // approval flag precedes --model
+      expect(withModel.indexOf('--dangerously-skip-permissions')).toBeLessThan(withModel.indexOf('--model'));
+    });
+    it('antigravity appends extraFlags after the model flag', () => {
+      const args = buildLaunchArgs('antigravity', { teamName: 't', workerName: 'w', cwd: '/tmp', model: 'm', extraFlags: ['--foo'] });
+      expect(args).toEqual(['--dangerously-skip-permissions', '--model', 'm', '--foo']);
+    });
+    it('grok includes --always-approve with no model and appends --model <m> when given', () => {
+      const noModel = buildLaunchArgs('grok', { teamName: 't', workerName: 'w', cwd: '/tmp' });
+      expect(noModel).toEqual(['--always-approve']);
+      expect(noModel).not.toContain('--model');
+
+      const withModel = buildLaunchArgs('grok', { teamName: 't', workerName: 'w', cwd: '/tmp', model: 'grok-4-fast' });
+      expect(withModel).toEqual(['--always-approve', '--model', 'grok-4-fast']);
     });
     it('passes model flag when specified', () => {
       const args = buildLaunchArgs('codex', { teamName: 't', workerName: 'w', cwd: '/tmp', model: 'gpt-4' });
@@ -458,6 +592,30 @@ describe('model-contract', () => {
       const c = getContract('codex');
       expect(c.supportsPromptMode).toBe(false);
       expect(c.promptModeFlag).toBeUndefined();
+    });
+
+    it('grok supports prompt mode', () => {
+      expect(isPromptModeAgent('grok')).toBe(true);
+      const c = getContract('grok');
+      expect(c.supportsPromptMode).toBe(true);
+      expect(c.promptModeFlag).toBe('-p');
+    });
+
+    it('antigravity supports prompt mode', () => {
+      expect(isPromptModeAgent('antigravity')).toBe(true);
+      const c = getContract('antigravity');
+      expect(c.supportsPromptMode).toBe(true);
+      expect(c.promptModeFlag).toBe('-p');
+    });
+
+    it('getPromptModeArgs returns flag + instruction for antigravity', () => {
+      const args = getPromptModeArgs('antigravity', 'Read inbox');
+      expect(args).toEqual(['-p', 'Read inbox']);
+    });
+
+    it('getPromptModeArgs returns flag + instruction for grok', () => {
+      const args = getPromptModeArgs('grok', 'Read inbox');
+      expect(args).toEqual(['-p', 'Read inbox']);
     });
 
     it('getPromptModeArgs returns flag + instruction for gemini', () => {

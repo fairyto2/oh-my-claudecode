@@ -152,8 +152,8 @@ Advanced: ambiguity ≤ 20%
         writeFileSync(join(tempConfigDir, 'skills', 'deep-interview', 'SKILL.md'), `---
 name: deep-interview
 description: Deep interview
-pipeline: [deep-interview, omc-plan, autopilot]
-next-skill: omc-plan
+pipeline: [deep-interview, plan, autopilot]
+next-skill: plan
 next-skill-args: --consensus --direct
 handoff: .omc/specs/deep-interview-{slug}.md
 ---
@@ -167,9 +167,9 @@ Deep interview body`);
         });
         expect(result.success).toBe(true);
         expect(result.replacementText).toContain('## Skill Pipeline');
-        expect(result.replacementText).toContain('Pipeline: `deep-interview → omc-plan → autopilot`');
+        expect(result.replacementText).toContain('Pipeline: `deep-interview → plan → autopilot`');
         expect(result.replacementText).toContain('Next skill arguments: `--consensus --direct`');
-        expect(result.replacementText).toContain('Skill("oh-my-claudecode:omc-plan")');
+        expect(result.replacementText).toContain('Skill("oh-my-claudecode:plan")');
         expect(result.replacementText).toContain('`.omc/specs/deep-interview-{slug}.md`');
     });
     it('discovers project-local compatibility skills from .agents/skills', async () => {
@@ -194,13 +194,44 @@ Compatibility body`);
         expect(result.replacementText).toContain('.agents/skills/compat-skill');
         expect(result.replacementText).toContain('`templates/`');
     });
+    it('discovers workspace-local Claude Code skills from .claude/skills before OMC compatibility skills', async () => {
+        mkdirSync(join(tempProjectDir, '.claude', 'skills', 'workspace-skill', 'references'), { recursive: true });
+        writeFileSync(join(tempProjectDir, '.claude', 'skills', 'workspace-skill', 'SKILL.md'), `---
+name: workspace-skill
+description: Workspace Claude skill
+---
+
+Workspace Claude skill body`);
+        writeFileSync(join(tempProjectDir, '.claude', 'skills', 'workspace-skill', 'references', 'example.md'), 'example');
+        mkdirSync(join(tempProjectDir, '.agents', 'skills', 'workspace-skill'), { recursive: true });
+        writeFileSync(join(tempProjectDir, '.agents', 'skills', 'workspace-skill', 'SKILL.md'), `---
+name: workspace-skill
+description: Compatibility duplicate
+---
+
+Compatibility duplicate body`);
+        const { findCommand, executeSlashCommand, listAvailableCommands } = await loadExecutor();
+        expect(findCommand('workspace-skill')?.path).toContain(join('.claude', 'skills', 'workspace-skill', 'SKILL.md'));
+        expect(listAvailableCommands().some((command) => command.name === 'workspace-skill')).toBe(true);
+        const result = executeSlashCommand({
+            command: 'workspace-skill',
+            args: '',
+            raw: '/workspace-skill',
+        });
+        expect(result.success).toBe(true);
+        expect(result.replacementText).toContain('Workspace Claude skill body');
+        expect(result.replacementText).toContain('## Skill Resources');
+        expect(result.replacementText).toContain('.claude/skills/workspace-skill');
+        expect(result.replacementText).toContain('`references/`');
+        expect(result.replacementText).not.toContain('Compatibility duplicate body');
+    });
     it('renders deterministic autoresearch bridge guidance for deep-interview autoresearch mode', async () => {
         mkdirSync(join(tempConfigDir, 'skills', 'deep-interview'), { recursive: true });
         writeFileSync(join(tempConfigDir, 'skills', 'deep-interview', 'SKILL.md'), `---
 name: deep-interview
 description: Deep interview
-pipeline: [deep-interview, omc-plan, autopilot]
-next-skill: omc-plan
+pipeline: [deep-interview, plan, autopilot]
+next-skill: plan
 next-skill-args: --consensus --direct
 handoff: .omc/specs/deep-interview-{slug}.md
 ---

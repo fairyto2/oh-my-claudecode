@@ -29,6 +29,8 @@ export function detectAllClis() {
         codex: detectCli('codex'),
         gemini: detectCli('gemini'),
         cursor: detectCli('cursor-agent'),
+        grok: detectCli('grok'),
+        antigravity: detectCli('agy'),
     };
 }
 //# sourceMappingURL=cli-detection.js.map

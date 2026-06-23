@@ -21,23 +21,24 @@ import { existsSync } from 'fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { TeamPaths, absPath, teamStateRoot } from './state-paths.js';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 import { allocateTasksToWorkers } from './allocation-policy.js';
 import { readTeamConfig, readWorkerStatus, readWorkerHeartbeat, readMonitorSnapshot, writeMonitorSnapshot, writeShutdownRequest, readShutdownAck, writeWorkerInbox, listTasksFromFiles, saveTeamConfig, cleanupTeamState, } from './monitor.js';
 import { appendTeamEvent, emitMonitorDerivedEvents } from './events.js';
 import { DEFAULT_TEAM_GOVERNANCE, DEFAULT_TEAM_TRANSPORT_POLICY, getConfigGovernance, } from './governance.js';
 import { inferPhase } from './phase-controller.js';
 import { validateTeamName } from './team-name.js';
-import { buildWorkerArgv, getContract, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveClaudeWorkerModel, } from './model-contract.js';
-import { createTeamSession, spawnWorkerInPane, sendToWorker, killTeamSession, waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, } from './tmux-session.js';
+import { buildWorkerArgv, getContract, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveClaudeWorkerModel, assertHeadlessSupported, isHeadlessSupportedOnPlatform, } from './model-contract.js';
+import { createTeamSession, spawnWorkerInPane, sendToWorker, killTeamSession, waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, captureTeamPane, sendTeamPaneKey, splitTeamWorkerPane, } from './tmux-session.js';
 import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, generatePromptModeStartupPrompt, } from './worker-bootstrap.js';
 import { queueInboxInstruction } from './mcp-comm.js';
 import { cleanupTeamWorktrees, inspectTeamWorktreeCleanupSafety, ensureWorkerWorktree, installWorktreeRootAgents, normalizeTeamWorktreeMode, } from './git-worktree.js';
 import { formatOmcCliInvocation } from '../utils/omc-cli-rendering.js';
 import { createSwallowedErrorLogger } from '../lib/swallowed-error.js';
-import { CANONICAL_TEAM_ROLES } from '../shared/types.js';
+import { CANONICAL_TEAM_ROLES, CURSOR_EXECUTOR_TEAM_ROLES } from '../shared/types.js';
 import { loadConfig } from '../config/loader.js';
 import { buildResolvedRoutingSnapshot, getRoleRoutingSpec } from './stage-router.js';
-import { routeTaskToRole } from './role-router.js';
+import { inferLaneIntent, routeTaskToRole } from './role-router.js';
 import { normalizeDelegationRole } from '../features/delegation-routing/types.js';
 import { cliWorkerOutputFilePath, parseCliWorkerVerdict, renderCliWorkerOutputContract, shouldInjectContract, } from './cli-worker-contract.js';
 import { startMergeOrchestrator, recoverFromRestart, } from './merge-orchestrator.js';
@@ -50,6 +51,23 @@ import { installCommitCadence, startFallbackPoller, uninstallCommitCadence, } fr
 // runtime-cli process). Lives at module scope so shutdownTeamV2 can find it.
 // ---------------------------------------------------------------------------
 const orchestratorByTeam = new Map();
+const CURSOR_UNSUPPORTED_REVIEW_INTENT_RE = /\b(?:review|audit|critic|critique|security|vulnerabilit|cve|owasp|xss|csrf|sqli|verdict|approval|approve|final\s+decision)\b/i;
+const CURSOR_EXECUTOR_CONTEXT_RE = /\b(?:implement|implementation|apply|edit|patch|fix|build|ci|lint|compile|tsc|type.?check|test|tests|debug|troubleshoot|investigate|root.?cause|diagnos|refactor|clean\s*up|simplif)\b/i;
+const CURSOR_EXECUTOR_CONTEXT_INTENTS = new Set([
+    'implementation',
+    'build-fix',
+    'debug',
+    'cleanup',
+    'verification',
+]);
+function isCursorExecutorContextTask(task) {
+    const text = `${task.subject} ${task.description}`.trim();
+    if (!text || CURSOR_UNSUPPORTED_REVIEW_INTENT_RE.test(text))
+        return false;
+    if (!CURSOR_EXECUTOR_CONTEXT_RE.test(text))
+        return false;
+    return CURSOR_EXECUTOR_CONTEXT_INTENTS.has(inferLaneIntent(text));
+}
 const cadenceByTeam = new Map();
 function registerTeamOrchestrator(teamName, handle) {
     orchestratorByTeam.set(teamName, handle);
@@ -120,7 +138,7 @@ const MONITOR_SIGNAL_STALE_MS = 30_000;
  * Returns the primary assignment by default; callers swap to the Claude
  * fallback if the primary provider's CLI binary is missing at spawn time.
  */
-function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, resolvedBinaryPaths, fallbackAgent) {
+export function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, resolvedBinaryPaths, fallbackAgent) {
     const canonicalRoles = new Set(CANONICAL_TEAM_ROLES);
     const hasExplicitRole = typeof task.role === 'string' && task.role.length > 0;
     const rawRole = hasExplicitRole
@@ -137,7 +155,28 @@ function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, resolve
     // pre-patch contract: `/team N:codex ...` stays on codex when config has no
     // per-role routing, even if the task text incidentally mentions "reviewer".
     const hasConfigForRole = !!getRoleRoutingSpec(roleRoutingConfig, canonical);
+    if (fallbackAgent === 'cursor') {
+        if (CURSOR_EXECUTOR_TEAM_ROLES.includes(canonical)) {
+            return { agentType: fallbackAgent, model: '', role: canonical };
+        }
+        if (!hasExplicitRole && !hasConfigForRole && isCursorExecutorContextTask(task)) {
+            return { agentType: fallbackAgent, model: '', role: 'executor' };
+        }
+    }
     if (!hasExplicitRole && !hasConfigForRole) {
+        if (fallbackAgent === 'cursor' && !CURSOR_EXECUTOR_TEAM_ROLES.includes(canonical)) {
+            throw new Error(`Cursor workers are executor-style only; inferred role "${canonical}" for task "${task.subject}" must run on a native Claude/OMC reviewer agent or another supported CLI worker.`);
+        }
+        return { agentType: fallbackAgent, model: '', role: canonical };
+    }
+    // Explicit provider + explicit role with NO per-role routing config: the user
+    // named the provider directly on the worker spec (e.g. `1:antigravity:executor`
+    // or `1:gemini:reviewer`), so honor that provider and treat the role as the
+    // prompt role, not a routing key. Without this, an explicit role would always
+    // opt into resolved_routing, whose default executor primary is Claude — silently
+    // launching Claude instead of the requested CLI provider. When `team.roleRouting`
+    // *is* configured for the role, that deliberate config still wins (below).
+    if (hasExplicitRole && !hasConfigForRole && fallbackAgent !== 'claude') {
         return { agentType: fallbackAgent, model: '', role: canonical };
     }
     const pair = resolvedRouting[canonical];
@@ -164,6 +203,11 @@ function shouldUseLaunchTimeCliResolution(reason) {
     return /untrusted location|relative path/i.test(reason);
 }
 function resolvePreflightBinaryPath(agentType) {
+    // Treat a platform-unsupported headless provider (e.g. antigravity on Windows)
+    // as unavailable during preflight, so role routing falls back cleanly to Claude
+    // instead of recording the binary and failing mid-spawn. Throws here are caught
+    // by startTeamV2's preflight loop and recorded as missingBinaryReasons.
+    assertHeadlessSupported(agentType);
     try {
         return { path: resolveValidatedBinaryPath(agentType), degraded: false };
     }
@@ -186,13 +230,7 @@ async function getWorkerPaneLiveness(paneId) {
 async function captureWorkerPane(paneId) {
     if (!paneId)
         return '';
-    try {
-        const result = await tmuxExecAsync(['capture-pane', '-t', paneId, '-p', '-S', '-80']);
-        return result.stdout ?? '';
-    }
-    catch {
-        return '';
-    }
+    return captureTeamPane(paneId);
 }
 function isFreshTimestamp(value, maxAgeMs = MONITOR_SIGNAL_STALE_MS) {
     if (!value)
@@ -261,7 +299,10 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, cliOutputCon
 // V2 worker spawning — direct tmux pane creation, no v1 delegation
 // ---------------------------------------------------------------------------
 async function notifyStartupInbox(sessionName, paneId, message) {
-    const notified = await notifyPaneWithRetry(sessionName, paneId, message);
+    // Startup inbox triggers are only safe to type once after readiness. If the
+    // pane still rejects the send (for example Claude is showing a startup
+    // banner), repeated tmux send-keys calls append duplicate trigger text.
+    const notified = await notifyPaneWithRetry(sessionName, paneId, message, 1);
     return notified
         ? { ok: true, transport: 'tmux_send_keys', reason: 'worker_pane_notified' }
         : { ok: false, transport: 'tmux_send_keys', reason: 'worker_notify_failed' };
@@ -319,19 +360,14 @@ async function spawnV2Worker(opts) {
     const splitTarget = opts.existingWorkerPaneIds.length === 0
         ? opts.leaderPaneId
         : opts.existingWorkerPaneIds[opts.existingWorkerPaneIds.length - 1];
-    const splitType = opts.existingWorkerPaneIds.length === 0 ? '-h' : '-v';
-    const splitResult = await tmuxExecAsync([
-        'split-window', splitType, '-t', splitTarget,
-        '-d', '-P', '-F', '#{pane_id}',
-        '-c', opts.workerCwd ?? opts.cwd,
-    ]);
-    const paneId = splitResult.stdout.split('\n')[0]?.trim();
+    const splitDirection = opts.existingWorkerPaneIds.length === 0 ? 'right' : 'down';
+    const paneId = await splitTeamWorkerPane(splitTarget, splitDirection, opts.workerCwd ?? opts.cwd);
     if (!paneId) {
         return { paneId: null, startupAssigned: false, startupFailureReason: 'pane_id_missing' };
     }
     const usePromptMode = isPromptModeAgent(opts.agentType);
     // AC-7: render the CLI-worker output contract when a reviewer-style role
-    // is routed to an external provider (codex/gemini). Claude workers speak
+    // is routed to an external provider (codex/gemini/grok). Claude workers speak
     // through the team messaging API and do not use the verdict-file contract.
     const injectContract = shouldInjectContract(opts.role ?? null, opts.agentType);
     const outputFile = injectContract && opts.role
@@ -362,7 +398,7 @@ async function spawnV2Worker(opts) {
     // For Claude agents on Bedrock/Vertex, resolve the provider-specific model
     // so workers don't fall back to invalid Anthropic API model names. (#1695)
     // Snapshot-provided model (from resolved_routing) takes precedence so
-    // per-role routing (codex/gemini/claude-tier) is honored at spawn time.
+    // per-role routing (codex/gemini/grok/cursor/claude-tier) is honored at spawn time.
     const modelForAgent = opts.model ?? (() => {
         if (opts.agentType === 'codex') {
             return process.env.OMC_EXTERNAL_MODELS_DEFAULT_CODEX_MODEL
@@ -374,6 +410,19 @@ async function spawnV2Worker(opts) {
                 || process.env.OMC_GEMINI_DEFAULT_MODEL
                 || undefined;
         }
+        if (opts.agentType === 'antigravity') {
+            return process.env.OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL
+                || process.env.OMC_ANTIGRAVITY_DEFAULT_MODEL
+                || undefined;
+        }
+        if (opts.agentType === 'grok') {
+            return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GROK_MODEL
+                || process.env.OMC_GROK_DEFAULT_MODEL
+                || undefined;
+        }
+        if (opts.agentType === 'cursor') {
+            return undefined;
+        }
         // Claude agents: resolve Bedrock/Vertex model when on those providers
         return resolveClaudeWorkerModel();
     })();
@@ -384,7 +433,7 @@ async function spawnV2Worker(opts) {
         resolvedBinaryPath,
         model: modelForAgent,
     });
-    // For prompt-mode agents (currently gemini), keep the full instruction in
+    // For prompt-mode agents (gemini, antigravity), keep the full instruction in
     // inbox.md and pass only a short file-pointer prompt via CLI args. This
     // avoids echoing reviewer/seed prompt text into tmux scrollback.
     if (usePromptMode) {
@@ -435,7 +484,7 @@ async function spawnV2Worker(opts) {
         triggerMessage: inboxTriggerMessage,
         cwd: opts.cwd,
         transportPreference: usePromptMode ? 'prompt_stdin' : 'transport_direct',
-        fallbackAllowed: false,
+        fallbackAllowed: DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_mode === 'hook_preferred_with_fallback',
         inboxCorrelationKey: `startup:${opts.workerName}:${opts.taskId}`,
         notify: async (_target, triggerMessage) => {
             if (usePromptMode) {
@@ -462,7 +511,23 @@ async function spawnV2Worker(opts) {
         };
     }
     if (opts.agentType === 'claude') {
-        const settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 6);
+        let settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 6);
+        // Claude Code v2.1.x sometimes swallows the Enter key sent immediately
+        // after a fresh pane reports ready — the TUI is still binding input
+        // handlers, so the dispatch message lands in the input buffer but is
+        // never submitted. By the time the evidence wait above finishes, the
+        // TUI is reliably accepting input. Resubmit Enter directly (the prompt
+        // is still sitting in the input buffer) and re-check evidence. Bounded
+        // retries so a truly hung worker still fails fast.
+        for (let attempt = 1; !settled && attempt <= 4; attempt++) {
+            try {
+                await sendTeamPaneKey(paneId, 'Enter');
+            }
+            catch {
+                break;
+            }
+            settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 12);
+        }
         if (!settled) {
             return {
                 paneId,
@@ -568,7 +633,20 @@ export async function startTeamV2(config) {
     // Validate CLIs and pin absolute binary paths for user-declared agentTypes.
     // AC-8: missing/untrusted binaries fall back to the snapshot's Claude tuple at
     // spawn time; emit a loud warning naming the binary so operators can fix it.
-    const agentTypes = config.agentTypes;
+    // Rewrite headless-unsupported direct workers (e.g. antigravity on Windows) to
+    // the Claude fallback up front, BEFORE any team state or tmux session is created.
+    // Direct launches like `omc team 1:antigravity` flow through `agentTypes` as the
+    // round-robin fallbackAgent for resolveTaskAssignment, so without this they would
+    // pass the unsupported provider through and only fail mid-spawn. (Role-routed
+    // primaries are handled separately by resolvePreflightBinaryPath's guard.)
+    const declaredAgentTypes = config.agentTypes;
+    const agentTypes = declaredAgentTypes.map((t) => {
+        if (!isHeadlessSupportedOnPlatform(t)) {
+            process.stderr.write(`[team/runtime-v2] ${t} headless mode is unsupported on this platform — using claude fallback for direct workers\n`);
+            return 'claude';
+        }
+        return t;
+    });
     const resolvedBinaryPaths = {};
     const missingBinaryReasons = [];
     for (const agentType of [...new Set(agentTypes)]) {
@@ -581,7 +659,7 @@ export async function startTeamV2(config) {
         }
     }
     // Best-effort resolve extra providers referenced by the routing snapshot
-    // (codex/gemini critic, reviewer, etc.). Missing binaries are tolerated —
+    // (codex/gemini/grok/cursor critic, reviewer, etc.). Missing binaries are tolerated —
     // the spawn path falls back to the snapshot's Claude fallback (AC-8).
     for (const { primary } of Object.values(resolvedRouting)) {
         const provider = primary.provider;
@@ -612,7 +690,7 @@ export async function startTeamV2(config) {
     // Create state directories
     await mkdir(absPath(leaderCwd, TeamPaths.tasks(sanitized)), { recursive: true });
     await mkdir(absPath(leaderCwd, TeamPaths.workers(sanitized)), { recursive: true });
-    await mkdir(join(leaderCwd, '.omc', 'state', 'team', sanitized, 'mailbox'), { recursive: true });
+    await mkdir(join(getOmcRoot(leaderCwd), 'state', 'team', sanitized, 'mailbox'), { recursive: true });
     // AC-8: emit a loud team-event warning naming every missing/untrusted CLI
     // binary so the leader surfaces the fallback decision instead of silently
     // swapping providers.
@@ -637,6 +715,7 @@ export async function startTeamV2(config) {
             status: 'pending',
             owner: null,
             result: null,
+            ...(config.tasks[i].role ? { role: config.tasks[i].role } : {}),
             ...(config.tasks[i].delegation ? { delegation: config.tasks[i].delegation } : {}),
             created_at: new Date().toISOString(),
         }, null, 2), 'utf-8');
@@ -678,6 +757,7 @@ export async function startTeamV2(config) {
             id: String(idx),
             subject: config.tasks[idx].subject,
             description: config.tasks[idx].description,
+            ...(config.tasks[idx].role ? { role: config.tasks[idx].role } : {}),
         }));
         const allocationWorkers = workerNames.map((name, i) => ({
             name,
@@ -1725,7 +1805,7 @@ export async function resumeTeamV2(teamName, cwd) {
 // findActiveTeams — discover running teams
 // ---------------------------------------------------------------------------
 export async function findActiveTeamsV2(cwd) {
-    const root = join(cwd, '.omc', 'state', 'team');
+    const root = join(getOmcRoot(cwd), 'state', 'team');
     if (!existsSync(root))
         return [];
     const entries = await readdir(root, { withFileTypes: true });

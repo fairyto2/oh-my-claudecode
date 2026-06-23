@@ -1,56 +1,50 @@
-# oh-my-claudecode v4.13.6: Reliability & macOS Hardening
+# oh-my-claudecode v4.15.0: add antigravity (agy), surface usage hint
 
-Bug fixes for session lifecycle, macOS launch path, and team auth, plus reviewer/designer agent upgrades for Opus 4.7. Net delivery is **14 PRs**: the omx-teams backport (#2903) shipped and was reverted (#2910) within the window, so team-runtime behavior matches v4.13.5.
+## Release Notes
 
-## Highlights
+Release with **2 new features**, **8 bug fixes**, **2 other changes** across **22 merged PRs**.
 
-### macOS launch path
+### Highlights
 
-- **`--madmax`/`--yolo` now require tmux on macOS** (#2909) — instead of silently launching direct, the launcher exits with a `brew install tmux` hint when tmux is missing, and surfaces the underlying error if `tmux new-session`/`attach-session` fails.
+- **feat(providers): add antigravity (agy) CLI as drop-in alternative to gemini** (#3315)
+- **feat(hud): surface usage hint for API-key users when built-in usage unavailable (#3277)** (#3277)
 
-### Session and cancel reliability
+### New Features
 
-- **Stop hook: clean up orphan session state** (#2912, fixes #2911) — sessions terminated by `cancel`/`stop` no longer leave behind active mode-state files that re-arm continuations.
-- **Cancel: clear Ralph stop hook artifacts** (#2897) — `cancelomc` now also clears the stop-hook scaffolding so Ralph can't restart.
-- **Persistent mode: ignore orphan autopilot routing echo** (#2899) — stale routing echoes from previous sessions no longer hijack the active session.
-- **Launch: preserve Claude auth in runtime config** (#2908, fixes #2906) — `claude.json` auth payload survives launcher rewrites.
+- **feat(providers): add antigravity (agy) CLI as drop-in alternative to gemini** (#3315)
+- **feat(hud): surface usage hint for API-key users when built-in usage unavailable (#3277)** (#3277)
 
-### Team and autoresearch correctness
+### Bug Fixes
 
-- **Team: use claude bare mode with API key auth** (#2890) — fixes auth handoff into team-spawned `claude` workers when `ANTHROPIC_API_KEY` is the active credential.
-- **Team: require delegation evidence for broad completions** (#2895) — broad task closures must show delegation evidence rather than self-declared completion.
-- **Autoresearch: stop discarding the first passing candidate** (#2905, by @stevenmorrisroe) — supervisor no longer drops the bootstrap candidate that already meets acceptance.
+- **fix(hooks): encode project paths in transcript resolution**
+- **fix(jsonc): tolerate trailing commas in JSONC config files**
+- **fix(post-tool-rules-injector): honor existing skip guards**
+- **fix(team): verify cursor worker start submission** (#3296)
+- **fix: configurable magic keyword triggers** (#3289)
+- **fix(persistent-mode): bound thinking-only continuation loops** (#3280)
+- **fix(session-search): fix Windows worktree transcript resolution + converge the encoder** (#3276)
+- **fix(session-search): strip drive colon so current-scope search finds transcripts on Windows** (#3274)
 
-### Agent upgrades for Opus 4.7
+### Documentation
 
-- **Designer agent: domain-aware override of Opus 4.7 editorial defaults** (#2893) — keeps designer outputs in the requested register instead of being rewritten by global editorial behavior.
-- **Code-reviewer agent: discovery/filter separation for Opus 4.7** (#2892) — splits "what could be wrong" from "what is severe enough to surface" so reviews don't drown in low-signal nits.
+- **docs(release): include PR #3300 in v4.14.8 notes**
+- **docs: clarify psmux Windows team caveats** (#3312)
+- **docs: clarify OMC automation and SDK surfaces**
+- **docs: audit Claude Code changelog compatibility** (#3303)
 
-### State and tooling fixes
+### Other Changes
 
-- **Project memory: keep detector authoritative for schema-known fields on rescan** (#2883) — rescans no longer clobber detector-owned fields with stale values.
-- **Project memory: preserve unknown fields across rescan** (#2882) — fields the schema doesn't recognize are passed through instead of dropped.
-- **Wiki: honor `workingDirectory` for manual worktrees** (#2880) — wiki tools resolve against the worktree root the user passed, not the parent repo.
-- **Post-tool verifier: recognize Edit success output** (#2877) — `Edit` results no longer flagged as failures by the verifier.
-- **Pre-tool: warn on fallback slop language** (#2878) — flags filler phrasing in tool-call narration before it reaches the user.
-- **Planning artifacts: timestamp canonical handoff files** (#2894) — handoff artifacts now carry timestamps so consumers can detect staleness.
+- **ci: run path-handling tests on a real Windows runner**
+- **ci: move workflows to GitHub-hosted runners** (#3287)
 
-### Docs
+### Stats
 
-- **Explain the prebuild-install warning** (#2914, fixes #2913) — clarifies the harmless `prebuild-install` warning during `npm install`.
+- **22 PRs merged** | **2 new features** | **8 bug fixes** | **0 security/hardening improvements** | **2 other changes**
 
-## Reverted in this window
-
-- **omx-teams backport (#2903)** was reverted by **#2910** after merge-safety review. Team runtime behavior is unchanged from v4.13.5.
-
-## Stats
-
-- **14 PRs net** | **5 features** | **11 fixes** | **1 docs** | **1 backport reverted**
-
-## Install / Update
+### Install / Update
 
 ```bash
-npm install -g oh-my-claude-sisyphus@4.13.6
+npm install -g oh-my-claude-sisyphus@4.15.0
 ```
 
 Or reinstall the plugin:
@@ -58,10 +52,4 @@ Or reinstall the plugin:
 claude /install-plugin oh-my-claudecode
 ```
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.13.5...v4.13.6
-
-## Contributors
-
-Thank you to all contributors who made this release possible!
-
-@devswha @EthanJStark @RobinNorberg @stevenmorrisroe @Yeachan-Heo
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.14.7...v4.15.0

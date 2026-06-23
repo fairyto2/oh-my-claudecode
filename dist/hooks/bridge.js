@@ -20,6 +20,7 @@ import { readModeState, writeModeState } from "../lib/mode-state-io.js";
 import { SESSION_END_MODE_STATE_FILES } from "../lib/mode-names.js";
 import { formatOmcCliInvocation } from "../utils/omc-cli-rendering.js";
 import { createSwallowedErrorLogger } from "../lib/swallowed-error.js";
+import { dispatchNotificationInBackground } from "./background-notifications.js";
 import { readCanonicalTeamStateCandidate } from "./team-canonical-state.js";
 // Hot-path imports: needed on every/most hook invocations (keyword-detector, pre/post-tool-use)
 import { removeCodeBlocks, getAllKeywordsWithSizeCheck, applyRalplanGate, sanitizeForKeywordDetection, NON_LATIN_SCRIPT_PATTERN, } from "./keyword-detector/index.js";
@@ -78,6 +79,7 @@ const TEAM_STAGE_ALIASES = {
     fixing: "team-fix",
 };
 const BACKGROUND_AGENT_ID_PATTERN = /agentId:\s*([a-zA-Z0-9_-]+)/;
+const BACKGROUND_BASH_ID_PATTERN = /(?:background (?:bash )?(?:command|process|task).*?(?:id|ID)|bash_id|task_id)[:=]\s*([a-zA-Z0-9_-]+)/i;
 const TASK_OUTPUT_ID_PATTERN = /<task_id>([^<]+)<\/task_id>/i;
 const TASK_OUTPUT_STATUS_PATTERN = /<status>([^<]+)<\/status>/i;
 const SAFE_SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
@@ -137,6 +139,9 @@ function buildSessionStartAdditionalContext(messages) {
     return selected.join("\n");
 }
 function readLinuxBootId() {
+    const testBootId = process.env.OMC_TEST_BOOT_ID?.trim();
+    if (testBootId)
+        return testBootId;
     try {
         if (!existsSync(LINUX_BOOT_ID_PATH))
             return undefined;
@@ -336,6 +341,23 @@ function extractAsyncAgentId(toolOutput) {
     }
     return toolOutput.match(BACKGROUND_AGENT_ID_PATTERN)?.[1];
 }
+function extractBackgroundBashId(toolOutput) {
+    if (typeof toolOutput !== "string") {
+        return undefined;
+    }
+    return toolOutput.match(BACKGROUND_BASH_ID_PATTERN)?.[1];
+}
+function bashLaunchIsBackgroundPending(toolOutput) {
+    if (typeof toolOutput !== "string") {
+        return false;
+    }
+    const normalized = toolOutput.toLowerCase();
+    return normalized.includes("running in the background")
+        || normalized.includes("started in the background")
+        || normalized.includes("background command")
+        || normalized.includes("background process")
+        || Boolean(extractBackgroundBashId(toolOutput));
+}
 function parseTaskOutputLifecycle(toolOutput) {
     if (typeof toolOutput !== "string") {
         return null;
@@ -356,6 +378,58 @@ function taskLaunchDidFail(toolOutput) {
     }
     const normalized = toolOutput.toLowerCase();
     return normalized.includes("error") || normalized.includes("failed");
+}
+function getSessionStateDir(directory, sessionId) {
+    const stateDir = join(getOmcRoot(directory), "state");
+    if (sessionId && SAFE_SESSION_ID_PATTERN.test(sessionId)) {
+        return join(stateDir, "sessions", sessionId);
+    }
+    return stateDir;
+}
+function getScheduledWakeupStatePath(directory, sessionId) {
+    return join(getSessionStateDir(directory, sessionId), "scheduled-wakeup-state.json");
+}
+function parseWakeupDueAt(toolInput) {
+    if (!toolInput || typeof toolInput !== "object") {
+        return undefined;
+    }
+    const input = toolInput;
+    const absolute = input.due_at ?? input.wakeup_at ?? input.scheduled_for ?? input.deadline_at ?? input.at;
+    if (typeof absolute === "string") {
+        const parsed = new Date(absolute).getTime();
+        if (Number.isFinite(parsed))
+            return new Date(parsed).toISOString();
+    }
+    const delaySeconds = input.seconds ?? input.delay_seconds ?? input.delaySeconds;
+    if (typeof delaySeconds === "number" && Number.isFinite(delaySeconds)) {
+        return new Date(Date.now() + Math.max(0, delaySeconds) * 1000).toISOString();
+    }
+    const delayMs = input.milliseconds ?? input.delay_ms ?? input.delayMs;
+    if (typeof delayMs === "number" && Number.isFinite(delayMs)) {
+        return new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+    }
+    const delayMinutes = input.minutes ?? input.delay_minutes ?? input.delayMinutes;
+    if (typeof delayMinutes === "number" && Number.isFinite(delayMinutes)) {
+        return new Date(Date.now() + Math.max(0, delayMinutes) * 60_000).toISOString();
+    }
+    return undefined;
+}
+function recordScheduledWakeup(directory, sessionId, toolInput) {
+    try {
+        const statePath = getScheduledWakeupStatePath(directory, sessionId);
+        mkdirSync(dirname(statePath), { recursive: true });
+        writeFileSync(statePath, JSON.stringify({
+            active: true,
+            pending: true,
+            status: "pending",
+            session_id: sessionId,
+            created_at: new Date().toISOString(),
+            due_at: parseWakeupDueAt(toolInput),
+        }, null, 2));
+    }
+    catch {
+        // Wakeup state is best-effort; never fail the hook.
+    }
 }
 function getModeStatePaths(directory, modeName, sessionId) {
     const stateDir = join(getOmcRoot(directory), "state");
@@ -484,7 +558,7 @@ function seedRalplanStartupState(directory, sessionId) {
     markModeAwaitingConfirmation(directory, sessionId, "ralplan");
 }
 async function seedAutopilotStartupState(directory, prompt, sessionId) {
-    const { readAutopilotState, writeAutopilotState, DEFAULT_CONFIG } = await import("./autopilot/index.js");
+    const { readAutopilotState, writeAutopilotState, DEFAULT_CONFIG, resolvePipelineConfig, buildPipelineTracking, } = await import("./autopilot/index.js");
     const existingState = readAutopilotState(directory, sessionId);
     const existingAutopilotRecord = existingState;
     if (existingState?.active === true) {
@@ -493,10 +567,12 @@ async function seedAutopilotStartupState(directory, prompt, sessionId) {
         }
         return;
     }
+    const config = loadConfig();
     const now = new Date().toISOString();
-    const wrote = writeAutopilotState(directory, {
+    const state = {
         active: true,
         phase: "expansion",
+        current_phase: "expansion",
         iteration: 1,
         max_iterations: DEFAULT_CONFIG.maxIterations ?? 10,
         originalIdea: prompt,
@@ -539,7 +615,15 @@ async function seedAutopilotStartupState(directory, prompt, sessionId) {
         wisdom_entries: 0,
         session_id: sessionId,
         project_path: directory,
-    }, sessionId);
+    };
+    const autopilotConfig = config.autopilot;
+    const shouldUsePipeline = autopilotConfig?.execution === "team";
+    if (shouldUsePipeline) {
+        const pipelineConfig = resolvePipelineConfig(autopilotConfig);
+        state.pipeline =
+            buildPipelineTracking(pipelineConfig);
+    }
+    const wrote = writeAutopilotState(directory, state, sessionId);
     if (wrote) {
         markModeAwaitingConfirmation(directory, sessionId, "autopilot");
     }
@@ -811,7 +895,7 @@ function getPromptText(input) {
     return "";
 }
 function isExplicitAskSlashInvocation(promptText) {
-    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini)\b/i.test(promptText);
+    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor)\b/i.test(promptText);
 }
 function activateRalplanStartupState(directory, sessionId) {
     const now = new Date().toISOString();
@@ -1159,7 +1243,9 @@ async function processKeywordDetector(input) {
                 messages.push(`[MODE: ${keywordType.toUpperCase()}] Skill invocation handled by UserPromptSubmit hook.`);
                 break;
             case "codex":
-            case "gemini": {
+            case "gemini":
+            case "cursor":
+            case "antigravity": {
                 const teamStartCommand = formatOmcCliInvocation(`team start --agent ${keywordType} --count N --task "<task from user message>"`);
                 messages.push(`[MAGIC KEYWORD: team]\n` +
                     `User intent: delegate to ${keywordType} CLI workers via ${formatOmcCliInvocation('team')}.\n` +
@@ -1254,14 +1340,11 @@ async function processPersistentMode(input) {
                 }
                 if (shouldSendIdleNotification(stateDir, sessionId, idleRepoState)) {
                     recordIdleNotificationSent(stateDir, sessionId, idleRepoState);
-                    const logSessionIdleNotifyFailure = createSwallowedErrorLogger('hooks.bridge session-idle notification failed');
-                    import("../notifications/index.js")
-                        .then(({ notify }) => notify("session-idle", {
+                    dispatchNotificationInBackground("session-idle", {
                         sessionId,
                         projectPath: directory,
                         profileName: process.env.OMC_NOTIFY_PROFILE,
-                    }).catch(logSessionIdleNotifyFailure))
-                        .catch(logSessionIdleNotifyFailure);
+                    });
                 }
             }
             // IMPORTANT: Do NOT clean up reply-listener/session-registry on Stop hooks.
@@ -1336,14 +1419,11 @@ async function processSessionStart(input) {
     initSilentAutoUpdate();
     // Send session-start notification (non-blocking, swallows errors)
     if (sessionId) {
-        const logSessionStartNotifyFailure = createSwallowedErrorLogger('hooks.bridge session-start notification failed');
-        import("../notifications/index.js")
-            .then(({ notify }) => notify("session-start", {
+        dispatchNotificationInBackground("session-start", {
             sessionId,
             projectPath: directory,
             profileName: process.env.OMC_NOTIFY_PROFILE,
-        }).catch(logSessionStartNotifyFailure))
-            .catch(logSessionStartNotifyFailure);
+        });
         // Wake OpenClaw gateway for session-start (non-blocking)
         _openclaw.wake("session-start", { sessionId, projectPath: directory });
     }
@@ -1540,7 +1620,7 @@ Please continue working on these tasks.
 This environment uses a non-standard model provider (AWS Bedrock, Google Vertex AI, or a proxy such as CC Switch / LiteLLM).
 
 How to pass \`model\` on Task/Agent calls:
-- Prefer a tier alias: \`model: "sonnet"\`, \`model: "opus"\`, or \`model: "haiku"\`. OMC's pre-tool enforcer resolves these to provider-safe IDs when one of these env vars is set: \`ANTHROPIC_DEFAULT_SONNET_MODEL\` (and sibling \`ANTHROPIC_DEFAULT_OPUS_MODEL\` / \`ANTHROPIC_DEFAULT_HAIKU_MODEL\`), \`CLAUDE_CODE_BEDROCK_SONNET_MODEL\` (and sibling \`CLAUDE_CODE_BEDROCK_OPUS_MODEL\` / \`CLAUDE_CODE_BEDROCK_HAIKU_MODEL\`), or \`OMC_SUBAGENT_MODEL\`.
+- Prefer a tier alias: \`model: "sonnet"\`, \`model: "opus"\`, \`model: "haiku"\`, or \`model: "fable"\` (Claude Fable 5, above Opus). OMC's pre-tool enforcer resolves these to provider-safe IDs when one of these env vars is set: \`ANTHROPIC_DEFAULT_SONNET_MODEL\` (and siblings \`ANTHROPIC_DEFAULT_OPUS_MODEL\` / \`ANTHROPIC_DEFAULT_HAIKU_MODEL\` / \`ANTHROPIC_DEFAULT_FABLE_MODEL\`), \`CLAUDE_CODE_BEDROCK_SONNET_MODEL\` (and siblings \`CLAUDE_CODE_BEDROCK_OPUS_MODEL\` / \`CLAUDE_CODE_BEDROCK_HAIKU_MODEL\` / \`CLAUDE_CODE_BEDROCK_FABLE_MODEL\`), or \`OMC_SUBAGENT_MODEL\`.
 - If none of those env vars are configured, the enforcer will deny the tier alias with an env-var configuration hint — set one of them in your \`settings.json\` env or shell profile.
 - The enforcer denies tier aliases it cannot resolve. It also denies provider-specific IDs that carry a \`[1m]\` context-window suffix or otherwise fail subagent-safe validation (sub-agents cannot inherit \`[1m]\`). Valid provider-specific IDs without extended-context suffixes are allowed.
 
@@ -1564,27 +1644,65 @@ The CLAUDE.md instruction "Pass model on Task calls: haiku, sonnet, opus" applie
     }
     return { continue: true };
 }
+function stringOrUndefined(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+export function extractAskUserQuestionPrompts(toolInput) {
+    const input = toolInput;
+    const questions = Array.isArray(input?.questions) ? input.questions : [];
+    return questions
+        .map((question) => {
+        const questionText = stringOrUndefined(question.question);
+        if (!questionText)
+            return null;
+        const rawOptions = Array.isArray(question.options) ? question.options : [];
+        const options = rawOptions
+            .map((option) => {
+            const label = stringOrUndefined(option.label);
+            if (!label)
+                return null;
+            const value = stringOrUndefined(option.value);
+            const description = stringOrUndefined(option.description);
+            return {
+                label,
+                ...(value ? { value } : {}),
+                ...(description ? { description } : {}),
+            };
+        })
+            .filter((option) => option !== null);
+        const allowOther = question.allowOther ?? question.allow_other;
+        const otherLabel = stringOrUndefined(question.otherLabel ?? question.other_label);
+        const multiSelect = question.multiSelect ?? question.multi_select;
+        const header = stringOrUndefined(question.header);
+        return {
+            question: questionText,
+            ...(header ? { header } : {}),
+            options,
+            allowOther: allowOther === false ? false : true,
+            otherLabel: otherLabel ?? "Other",
+            multiSelect: multiSelect === true,
+        };
+    })
+        .filter((question) => question !== null);
+}
 /**
  * Fire-and-forget notification for AskUserQuestion (issue #597).
  * Extracted for testability; the dynamic import makes direct assertion
  * on the notify() call timing-sensitive, so tests spy on this wrapper instead.
  */
 export function dispatchAskUserQuestionNotification(sessionId, directory, toolInput) {
-    const input = toolInput;
-    const questions = input?.questions || [];
-    const questionText = questions
-        .map((q) => q.question || "")
+    const prompts = extractAskUserQuestionPrompts(toolInput);
+    const questionText = prompts
+        .map((q) => q.question)
         .filter(Boolean)
         .join("; ") || "User input requested";
-    const logAskUserQuestionNotifyFailure = createSwallowedErrorLogger('hooks.bridge ask-user-question notification failed');
-    import("../notifications/index.js")
-        .then(({ notify }) => notify("ask-user-question", {
+    dispatchNotificationInBackground("ask-user-question", {
         sessionId,
         projectPath: directory,
         question: questionText,
+        askUserQuestionPrompts: prompts,
         profileName: process.env.OMC_NOTIFY_PROFILE,
-    }).catch(logAskUserQuestionNotifyFailure))
-        .catch(logAskUserQuestionNotifyFailure);
+    });
 }
 /** @internal Object wrapper so tests can spy on the dispatch call. */
 export const _notify = {
@@ -1811,16 +1929,13 @@ function processPreToolUse(input) {
         const agentName = agentType?.includes(":")
             ? agentType.split(":").pop()
             : agentType;
-        const logAgentCallNotifyFailure = createSwallowedErrorLogger('hooks.bridge agent-call notification failed');
-        import("../notifications/index.js")
-            .then(({ notify }) => notify("agent-call", {
+        dispatchNotificationInBackground("agent-call", {
             sessionId: input.sessionId,
             projectPath: directory,
             agentName,
             agentType,
             profileName: process.env.OMC_NOTIFY_PROFILE,
-        }).catch(logAgentCallNotifyFailure))
-            .catch(logAgentCallNotifyFailure);
+        });
     }
     // Warn about pkill -f self-termination risk (issue #210)
     // Matches: pkill -f, pkill -9 -f, pkill --full, etc.
@@ -1868,6 +1983,20 @@ function processPreToolUse(input) {
                 ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             addBackgroundTask(taskId, toolInput.description, toolInput.subagent_type, directory, input.sessionId);
         }
+    }
+    // Track background Bash invocations too. Ralph's Stop hook uses this
+    // session-owned pending-work signal to avoid reinforcing while Claude Code is
+    // expected to notify when the background command finishes.
+    if (input.toolName === "Bash") {
+        const toolInput = (modifiedToolInput ?? input.toolInput);
+        if (toolInput?.run_in_background === true && toolInput.command) {
+            const taskId = getHookToolUseId(input)
+                ?? `bash-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            addBackgroundTask(taskId, toolInput.command, "bash", directory, input.sessionId);
+        }
+    }
+    if ((input.toolName || "").toLowerCase() === "schedulewakeup") {
+        recordScheduledWakeup(directory, input.sessionId, input.toolInput);
     }
     // Track file ownership for Edit/Write tools
     if (input.toolName === "Edit" || input.toolName === "Write") {
@@ -2022,6 +2151,31 @@ async function processPostToolUse(input) {
             }
         }
     }
+    if (input.toolName === "Bash") {
+        const toolInput = input.toolInput;
+        if (toolInput?.run_in_background === true) {
+            const toolUseId = getHookToolUseId(input);
+            const backgroundBashId = extractBackgroundBashId(input.toolOutput);
+            const command = toolInput.command;
+            if (backgroundBashId) {
+                if (toolUseId) {
+                    remapBackgroundTaskId(toolUseId, backgroundBashId, directory, input.sessionId);
+                }
+                else if (command) {
+                    remapMostRecentMatchingBackgroundTaskId(command, backgroundBashId, directory, "bash", input.sessionId);
+                }
+            }
+            else if (!bashLaunchIsBackgroundPending(input.toolOutput)) {
+                const failed = taskLaunchDidFail(input.toolOutput);
+                if (toolUseId) {
+                    completeBackgroundTask(toolUseId, directory, failed, input.sessionId);
+                }
+                else if (command) {
+                    completeMostRecentMatchingBackgroundTask(command, directory, failed, "bash", input.sessionId);
+                }
+            }
+        }
+    }
     // After delegation completion, show updated agent dashboard
     if (isDelegationToolName(input.toolName)) {
         const dashboard = getAgentDashboard(directory);
@@ -2061,13 +2215,25 @@ async function processPostToolUse(input) {
 async function processAutopilot(input) {
     const directory = resolveToWorktreeRoot(input.directory);
     // Lazy-load autopilot module
-    const { readAutopilotState, getPhasePrompt } = await import("./autopilot/index.js");
+    const { readAutopilotState, getPhasePrompt, hasPipelineTracking, generatePipelinePrompt, } = await import("./autopilot/index.js");
     const state = readAutopilotState(directory, input.sessionId);
     if (!state || !state.active) {
         return { continue: true };
     }
-    // Check phase and inject appropriate prompt
     const config = loadConfig();
+    if (hasPipelineTracking(state)) {
+        const pipelinePrompt = generatePipelinePrompt(directory, input.sessionId);
+        const runtimeInsight = formatAutopilotRuntimeInsight(directory, input.sessionId);
+        if (pipelinePrompt || runtimeInsight) {
+            const detailParts = [runtimeInsight, pipelinePrompt].filter(Boolean);
+            return {
+                continue: true,
+                message: `[AUTOPILOT - Pipeline]\n\n${detailParts.join("\n\n")}`,
+            };
+        }
+        return { continue: true };
+    }
+    // Check phase and inject appropriate prompt
     const context = {
         idea: state.originalIdea,
         specPath: state.expansion.spec_path || ".omc/autopilot/spec.md",
@@ -2271,7 +2437,7 @@ export async function processHook(hookType, rawInput) {
             }
             case "code-simplifier": {
                 const directory = input.directory ?? process.cwd();
-                const stateDir = join(resolveToWorktreeRoot(directory), ".omc", "state");
+                const stateDir = join(getOmcRoot(directory), "state");
                 const { processCodeSimplifier } = await import("./code-simplifier/index.js");
                 const result = processCodeSimplifier(directory, stateDir);
                 if (result.shouldBlock) {

@@ -102,6 +102,20 @@ function agentTypeGuidance(agentType: CliAgentType): string {
         `- You MUST run \`${claimTaskCommand}\` before starting work and \`${transitionTaskStatusCommand}\` when done. Then keep waiting for the next mailbox message; do NOT type \`/exit\` unless the leader sends an explicit shutdown.`,
         '- Reviewer/critic/security-review roles are NOT supported for cursor workers — those require a verdict-file write-and-exit which the REPL does not perform. Take only executor-style tasks.',
       ].join('\n');
+    case 'grok':
+      return [
+        '### Agent-Type Guidance (grok)',
+        `- Prefer short, explicit \`${teamApiCommand} ... --json\` commands and parse outputs before next step.`,
+        '- If a command fails, report the exact stderr to leader-fixed before retrying.',
+        `- You MUST run \`${claimTaskCommand}\` before starting work and \`${transitionTaskStatusCommand}\` when done.`,
+      ].join('\n');
+    case 'antigravity':
+      return [
+        '### Agent-Type Guidance (antigravity)',
+        '- Execute task work in small, verifiable increments and report each milestone to leader-fixed.',
+        '- Keep commit-sized changes scoped to assigned files only; no broad refactors.',
+        `- CRITICAL: You MUST run \`${claimTaskCommand}\` before starting work and \`${transitionTaskStatusCommand}\` when done. Do not exit without transitioning the task status.`,
+      ].join('\n');
     case 'claude':
     default:
       return [

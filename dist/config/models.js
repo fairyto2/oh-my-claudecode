@@ -1,7 +1,7 @@
 import { validateAnthropicBaseUrl } from '../utils/ssrf-guard.js';
 const DIRECT_MODEL_ENV_KEYS = ['CLAUDE_MODEL', 'ANTHROPIC_MODEL'];
 const INHERIT_TIER_PRIORITY = ['MEDIUM', 'HIGH', 'LOW'];
-const CLAUDE_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
+const CLAUDE_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
 const TIER_ENV_KEYS = {
     LOW: [
         'OMC_MODEL_LOW',
@@ -26,7 +26,8 @@ const TIER_ENV_KEYS = {
 export const CLAUDE_FAMILY_DEFAULTS = {
     HAIKU: 'claude-haiku-4-5',
     SONNET: 'claude-sonnet-4-6',
-    OPUS: 'claude-opus-4-7',
+    OPUS: 'claude-opus-4-8',
+    FABLE: 'claude-fable-5',
 };
 /** Canonical tier->model mapping used as built-in defaults */
 export const BUILTIN_TIER_MODEL_DEFAULTS = {
@@ -39,11 +40,13 @@ export const CLAUDE_FAMILY_HIGH_VARIANTS = {
     HAIKU: `${CLAUDE_FAMILY_DEFAULTS.HAIKU}-high`,
     SONNET: `${CLAUDE_FAMILY_DEFAULTS.SONNET}-high`,
     OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`,
+    FABLE: `${CLAUDE_FAMILY_DEFAULTS.FABLE}-high`,
 };
 /** Built-in defaults for external provider models */
 export const BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
     codexModel: 'gpt-5.3-codex',
     geminiModel: 'gemini-3.1-pro-preview',
+    antigravityModel: 'Gemini 3.1 Pro (High)',
 };
 /**
  * Centralized Model ID Constants
@@ -163,6 +166,8 @@ export function resolveClaudeFamily(modelId) {
         return 'OPUS';
     if (lower.includes('haiku'))
         return 'HAIKU';
+    if (lower.includes('fable'))
+        return 'FABLE';
     return null;
 }
 /**
@@ -175,9 +180,11 @@ export function getClaudeHighVariantFromModel(modelId) {
 }
 /** Get built-in default model for an external provider */
 export function getBuiltinExternalDefaultModel(provider) {
-    return provider === 'codex'
-        ? BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel
-        : BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
+    if (provider === 'codex')
+        return BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel;
+    if (provider === 'antigravity')
+        return BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel;
+    return BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
 }
 function hasBedrockModelId(modelIds) {
     for (const modelId of modelIds) {

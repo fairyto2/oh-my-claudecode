@@ -86,7 +86,7 @@ function writeStopBreaker(tempDir, sessionId, name, count) {
 function writeSubagentTrackingState(tempDir, agents) {
     const stateDir = join(tempDir, '.omc', 'state');
     mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+    writeFileSync(join(stateDir, 'subagent-tracking-state.json'), JSON.stringify({
         agents,
         total_spawned: agents.length,
         total_completed: agents.filter((agent) => agent.status === 'completed').length,
@@ -525,8 +525,11 @@ describe('ralplan standalone stop enforcement', () => {
         ['terminated'],
         ['canceled'],
         ['handoff'],
+        ['pending_approval'],
+        ['pending approval'],
+        ['awaiting_approval'],
     ])('allows stop when ralplan current_phase is %s', async (phase) => {
-        const sessionId = `session-ralplan-terminal-${phase}`;
+        const sessionId = `session-ralplan-terminal-${phase.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
         const tempDir = makeTempProject();
         try {
             writeRalplanState(tempDir, sessionId, { current_phase: phase });
@@ -550,6 +553,22 @@ describe('ralplan standalone stop enforcement', () => {
             const result = await checkPersistentModes(sessionId, tempDir);
             expect(result.shouldBlock).toBe(false);
             expect(result.mode).toBe('ralplan');
+        }
+        finally {
+            rmSync(tempDir, { recursive: true, force: true });
+        }
+    });
+    it('reinforces active ralplan as read-only planning after compact continuation', async () => {
+        const sessionId = 'session-ralplan-compact-readonly';
+        const tempDir = makeTempProject();
+        try {
+            writeRalplanState(tempDir, sessionId, { current_phase: 'ralplan' });
+            const result = await checkPersistentModes(sessionId, tempDir);
+            expect(result.shouldBlock).toBe(true);
+            expect(result.mode).toBe('ralplan');
+            expect(result.message).toContain('read-only/planning mode');
+            expect(result.message).toContain('require explicit user approval before execution');
+            expect(result.message).not.toContain('implement the plan');
         }
         finally {
             rmSync(tempDir, { recursive: true, force: true });
@@ -635,7 +654,7 @@ describe('ralplan standalone stop enforcement', () => {
                 },
             ]);
             const staleUpdatedAt = new Date(now.getTime() - 10_000).toISOString();
-            const trackingPath = join(tempDir, '.omc', 'state', 'subagent-tracking.json');
+            const trackingPath = join(tempDir, '.omc', 'state', 'subagent-tracking-state.json');
             const tracking = JSON.parse(readFileSync(trackingPath, 'utf-8'));
             tracking.last_updated = staleUpdatedAt;
             writeFileSync(trackingPath, JSON.stringify(tracking, null, 2));

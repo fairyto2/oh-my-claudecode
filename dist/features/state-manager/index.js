@@ -14,7 +14,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { atomicWriteJsonSync } from "../../lib/atomic-write.js";
-import { OmcPaths, getWorktreeRoot, validateWorkingDirectory, } from "../../lib/worktree-paths.js";
+import { OmcPaths, getWorktreeRoot, getOmcRoot, validateWorkingDirectory, } from "../../lib/worktree-paths.js";
 import { getGlobalOmcStateRoot, getLegacyOmcPath } from "../../utils/paths.js";
 import { StateLocation, DEFAULT_STATE_CONFIG, } from "./types.js";
 // Standard state directories
@@ -81,6 +81,14 @@ export function ensureStateDir(location) {
         fs.mkdirSync(dir, { recursive: true });
     }
 }
+function resolveLegacyStatePath(legacyPath) {
+    return path.isAbsolute(legacyPath)
+        ? legacyPath
+        : path.join(getWorktreeRoot() || process.cwd(), legacyPath);
+}
+function warnStateReadFailure(kind, filePath, error) {
+    console.warn(`Failed to read ${kind} from ${filePath}:`, error);
+}
 /**
  * Read state from file
  *
@@ -144,16 +152,13 @@ export function readState(name, location = StateLocation.LOCAL, options) {
         }
         catch (error) {
             // Invalid JSON or read error - treat as not found
-            console.warn(`Failed to read state from ${standardPath}:`, error);
+            warnStateReadFailure("state", standardPath, error);
         }
     }
     // Try legacy locations
     if (checkLegacy) {
         for (const legacyPath of legacyPaths) {
-            // Resolve relative paths
-            const resolvedPath = path.isAbsolute(legacyPath)
-                ? legacyPath
-                : path.join(getWorktreeRoot() || process.cwd(), legacyPath);
+            const resolvedPath = resolveLegacyStatePath(legacyPath);
             if (fs.existsSync(resolvedPath)) {
                 try {
                     const content = fs.readFileSync(resolvedPath, "utf-8");
@@ -166,7 +171,7 @@ export function readState(name, location = StateLocation.LOCAL, options) {
                     };
                 }
                 catch (error) {
-                    console.warn(`Failed to read legacy state from ${resolvedPath}:`, error);
+                    warnStateReadFailure("legacy state", resolvedPath, error);
                 }
             }
         }
@@ -251,9 +256,7 @@ export function clearState(name, location) {
     // Remove from legacy locations
     const legacyPaths = getLegacyPaths(name, location ?? StateLocation.LOCAL);
     for (const legacyPath of legacyPaths) {
-        const resolvedPath = path.isAbsolute(legacyPath)
-            ? legacyPath
-            : path.join(getWorktreeRoot() || process.cwd(), legacyPath);
+        const resolvedPath = resolveLegacyStatePath(legacyPath);
         try {
             if (fs.existsSync(resolvedPath)) {
                 fs.unlinkSync(resolvedPath);
@@ -478,7 +481,7 @@ export function isStateStale(meta, now, maxAgeMs) {
  */
 export function cleanupStaleStates(directory, maxAgeMs = MAX_STATE_AGE_MS) {
     const stateDir = directory
-        ? path.join(directory, ".omc", "state")
+        ? path.join(getOmcRoot(directory), "state")
         : getLocalStateDir();
     if (!fs.existsSync(stateDir))
         return 0;

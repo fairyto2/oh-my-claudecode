@@ -1,11 +1,11 @@
 import { validateAnthropicBaseUrl } from '../utils/ssrf-guard.js';
 
 export type ModelTier = 'LOW' | 'MEDIUM' | 'HIGH';
-export type ClaudeModelFamily = 'HAIKU' | 'SONNET' | 'OPUS';
+export type ClaudeModelFamily = 'HAIKU' | 'SONNET' | 'OPUS' | 'FABLE';
 
 const DIRECT_MODEL_ENV_KEYS = ['CLAUDE_MODEL', 'ANTHROPIC_MODEL'] as const;
 const INHERIT_TIER_PRIORITY: readonly ModelTier[] = ['MEDIUM', 'HIGH', 'LOW'];
-const CLAUDE_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
+const CLAUDE_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
 
 const TIER_ENV_KEYS: Record<ModelTier, readonly string[]> = {
   LOW: [
@@ -32,7 +32,8 @@ const TIER_ENV_KEYS: Record<ModelTier, readonly string[]> = {
 export const CLAUDE_FAMILY_DEFAULTS: Record<ClaudeModelFamily, string> = {
   HAIKU: 'claude-haiku-4-5',
   SONNET: 'claude-sonnet-4-6',
-  OPUS: 'claude-opus-4-7',
+  OPUS: 'claude-opus-4-8',
+  FABLE: 'claude-fable-5',
 };
 
 /** Canonical tier->model mapping used as built-in defaults */
@@ -47,12 +48,14 @@ export const CLAUDE_FAMILY_HIGH_VARIANTS: Record<ClaudeModelFamily, string> = {
   HAIKU: `${CLAUDE_FAMILY_DEFAULTS.HAIKU}-high`,
   SONNET: `${CLAUDE_FAMILY_DEFAULTS.SONNET}-high`,
   OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`,
+  FABLE: `${CLAUDE_FAMILY_DEFAULTS.FABLE}-high`,
 };
 
 /** Built-in defaults for external provider models */
 export const BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
   codexModel: 'gpt-5.3-codex',
   geminiModel: 'gemini-3.1-pro-preview',
+  antigravityModel: 'Gemini 3.1 Pro (High)',
 } as const;
 
 /**
@@ -190,6 +193,7 @@ export function resolveClaudeFamily(modelId: string): ClaudeModelFamily | null {
   if (lower.includes('sonnet')) return 'SONNET';
   if (lower.includes('opus')) return 'OPUS';
   if (lower.includes('haiku')) return 'HAIKU';
+  if (lower.includes('fable')) return 'FABLE';
 
   return null;
 }
@@ -204,10 +208,10 @@ export function getClaudeHighVariantFromModel(modelId: string): string | null {
 }
 
 /** Get built-in default model for an external provider */
-export function getBuiltinExternalDefaultModel(provider: 'codex' | 'gemini'): string {
-  return provider === 'codex'
-    ? BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel
-    : BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
+export function getBuiltinExternalDefaultModel(provider: 'codex' | 'gemini' | 'antigravity'): string {
+  if (provider === 'codex') return BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel;
+  if (provider === 'antigravity') return BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel;
+  return BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
 }
 
 

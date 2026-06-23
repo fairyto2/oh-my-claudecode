@@ -3,12 +3,13 @@
  * Scans for and reports plugin coexistence issues.
  */
 import { readFileSync, existsSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { basename, dirname, join } from 'path';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
 import { isOmcHook } from '../../installer/index.js';
 import { colors } from '../utils/formatting.js';
-import { listBuiltinSkillNames } from '../../features/builtin-skills/skills.js';
+import { getSkillsDir, listBuiltinSkillNames } from '../../features/builtin-skills/skills.js';
 import { inspectUnifiedMcpRegistrySync } from '../../installer/mcp-registry.js';
+import { findWorkspaceRoot, WORKSPACE_MARKER } from '../../lib/worktree-paths.js';
 /**
  * Collect hook entries from a single settings.json file.
  */
@@ -72,6 +73,51 @@ export function checkHookConflicts() {
         }
     }
     return merged;
+}
+function isWindowsUnsafePluginHookCommand(command) {
+    return command.includes('find-node.sh')
+        || command.includes('/bin/sh')
+        || /^sh\s/.test(command);
+}
+/**
+ * Native Windows cannot execute plugin hooks that still route through sh/find-node.
+ * Detect stale cache manifests so doctor can point users at setup/update repair
+ * instead of reporting a generic hook conflict.
+ */
+export function checkWindowsUnsafePluginHooks() {
+    if (process.platform !== 'win32') {
+        return [];
+    }
+    const roots = [process.env.CLAUDE_PLUGIN_ROOT, ...readInstalledPluginRoots()]
+        .filter((root) => typeof root === 'string' && root.length > 0);
+    const seenRoots = new Set();
+    const unsafe = [];
+    for (const pluginRoot of roots) {
+        if (seenRoots.has(pluginRoot))
+            continue;
+        seenRoots.add(pluginRoot);
+        const hooksJsonPath = join(pluginRoot, 'hooks', 'hooks.json');
+        if (!existsSync(hooksJsonPath))
+            continue;
+        try {
+            const parsed = JSON.parse(readFileSync(hooksJsonPath, 'utf-8'));
+            for (const [event, groups] of Object.entries(parsed.hooks ?? {})) {
+                for (const group of groups) {
+                    for (const hook of group.hooks ?? []) {
+                        if (hook.type !== 'command' || typeof hook.command !== 'string')
+                            continue;
+                        if (isWindowsUnsafePluginHookCommand(hook.command)) {
+                            unsafe.push({ pluginRoot, event, command: hook.command });
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            // Ignore unreadable manifests; doctor should remain best-effort.
+        }
+    }
+    return unsafe;
 }
 /**
  * Check a single file for OMC markers.
@@ -187,6 +233,125 @@ export function checkEnvFlags() {
     }
     return { disableOmc, skipHooks };
 }
+const SETUP_FALLBACK_SKILL_NAMES = new Set(['omc-reference']);
+function parseSemverLikeVersion(version) {
+    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+        return null;
+    }
+    return version.split(/[+-]/, 1)[0].split('.').map(part => Number.parseInt(part, 10));
+}
+function compareSemverLikeVersions(a, b) {
+    const parsedA = parseSemverLikeVersion(a);
+    const parsedB = parseSemverLikeVersion(b);
+    if (!parsedA || !parsedB) {
+        return 0;
+    }
+    for (let index = 0; index < 3; index += 1) {
+        const delta = parsedA[index] - parsedB[index];
+        if (delta !== 0) {
+            return delta;
+        }
+    }
+    return 0;
+}
+function isValidSetupPluginRoot(pluginRoot) {
+    return existsSync(join(pluginRoot, 'docs', 'CLAUDE.md'));
+}
+function readInstalledPluginRoots() {
+    const installedPluginsPath = join(getClaudeConfigDir(), 'plugins', 'installed_plugins.json');
+    if (!existsSync(installedPluginsPath)) {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(readFileSync(installedPluginsPath, 'utf-8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return [];
+        }
+        const plugins = 'plugins' in parsed
+            && parsed.plugins
+            && typeof parsed.plugins === 'object'
+            && !Array.isArray(parsed.plugins)
+            ? parsed.plugins
+            : parsed;
+        return Object.entries(plugins)
+            .filter(([key]) => key.startsWith('oh-my-claudecode'))
+            .flatMap(([, value]) => Array.isArray(value) ? value : [])
+            .map(entry => entry && typeof entry === 'object' && 'installPath' in entry
+            ? entry.installPath
+            : null)
+            .filter((installPath) => typeof installPath === 'string' && installPath.length > 0);
+    }
+    catch {
+        return [];
+    }
+}
+function findLatestSiblingPluginRoot(pluginRoot) {
+    const cacheBase = dirname(pluginRoot);
+    if (!existsSync(cacheBase)) {
+        return null;
+    }
+    try {
+        return readdirSync(cacheBase)
+            .filter(entry => parseSemverLikeVersion(entry))
+            .map(entry => join(cacheBase, entry))
+            .filter(isValidSetupPluginRoot)
+            .sort((a, b) => compareSemverLikeVersions(basename(b), basename(a)))[0] || null;
+    }
+    catch {
+        return null;
+    }
+}
+function getSetupFallbackCanonicalSkillPaths(baseName) {
+    const currentSkillsDir = getSkillsDir();
+    const currentPluginRoot = dirname(currentSkillsDir);
+    const roots = [
+        currentPluginRoot,
+        process.env.CLAUDE_PLUGIN_ROOT,
+        ...readInstalledPluginRoots(),
+    ].filter((root) => typeof root === 'string' && root.length > 0);
+    for (const root of [...roots]) {
+        const latestSibling = findLatestSiblingPluginRoot(root);
+        if (latestSibling) {
+            roots.push(latestSibling);
+        }
+    }
+    const seen = new Set();
+    return [
+        join(currentSkillsDir, baseName, 'SKILL.md'),
+        ...roots.flatMap(root => [join(root, 'skills', baseName, 'SKILL.md')]),
+    ]
+        .filter(path => {
+        if (seen.has(path)) {
+            return false;
+        }
+        seen.add(path);
+        return true;
+    });
+}
+function isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName) {
+    if (!SETUP_FALLBACK_SKILL_NAMES.has(baseName)) {
+        return false;
+    }
+    // scripts/setup-claude-md.sh intentionally syncs the raw bundled
+    // skills/omc-reference/SKILL.md file into ~/.claude/skills/omc-reference/SKILL.md
+    // as a Claude CLI fallback. Suppress only that exact, unmodified sync so real
+    // legacy collisions and user-edited omc-reference copies still surface.
+    if (entry.toLowerCase() !== baseName) {
+        return false;
+    }
+    const installedSkillPath = join(legacySkillsDir, entry, 'SKILL.md');
+    if (!existsSync(installedSkillPath)) {
+        return false;
+    }
+    try {
+        const installedContent = readFileSync(installedSkillPath, 'utf-8');
+        return getSetupFallbackCanonicalSkillPaths(baseName).some(canonicalSkillPath => (existsSync(canonicalSkillPath)
+            && installedContent === readFileSync(canonicalSkillPath, 'utf-8')));
+    }
+    catch {
+        return false;
+    }
+}
 /**
  * Check for legacy curl-installed skills that collide with plugin skill names.
  * Only flags skills whose names match actual installed plugin skills, avoiding
@@ -204,6 +369,9 @@ export function checkLegacySkills() {
             // Match .md files or directories whose name collides with a plugin skill
             const baseName = entry.replace(/\.md$/i, '').toLowerCase();
             if (pluginSkillNames.has(baseName)) {
+                if (isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName)) {
+                    continue;
+                }
                 collisions.push({ name: baseName, path: join(legacySkillsDir, entry) });
             }
         }
@@ -274,6 +442,24 @@ export function checkConfigIssues() {
     return { unknownFields };
 }
 /**
+ * Check for .omc-workspace marker presence and OMC_STATE_DIR precedence.
+ *
+ * Reports:
+ *  - Whether a .omc-workspace marker was found (and where).
+ *  - Whether OMC_STATE_DIR is set.
+ *  - When both are set, emits a precedenceConflict flag (OMC_STATE_DIR wins per
+ *    the resolution-order principle: OMC_STATE_DIR > .omc-workspace > git > cwd).
+ */
+export function checkWorkspaceMarker() {
+    const markerRoot = findWorkspaceRoot();
+    const stateDirEnvValue = process.env.OMC_STATE_DIR && process.env.OMC_STATE_DIR.trim()
+        ? process.env.OMC_STATE_DIR.trim()
+        : null;
+    const stateDirEnvSet = stateDirEnvValue !== null;
+    const precedenceConflict = stateDirEnvSet && markerRoot !== null;
+    return { markerRoot, stateDirEnvSet, stateDirEnvValue, precedenceConflict };
+}
+/**
  * Run complete conflict check
  */
 export function runConflictCheck() {
@@ -282,25 +468,31 @@ export function runConflictCheck() {
     const legacySkills = checkLegacySkills();
     const envFlags = checkEnvFlags();
     const configIssues = checkConfigIssues();
+    const windowsUnsafePluginHooks = checkWindowsUnsafePluginHooks();
     const mcpRegistrySync = inspectUnifiedMcpRegistrySync();
+    const workspaceMarker = checkWorkspaceMarker();
     // Determine if there are actual conflicts
     const hasConflicts = hookConflicts.some(h => !h.isOmc) || // Non-OMC hooks present
         legacySkills.length > 0 || // Legacy skills colliding with plugin
         envFlags.disableOmc || // OMC is disabled
         envFlags.skipHooks.length > 0 || // Hooks are being skipped
         configIssues.unknownFields.length > 0 || // Unknown config fields
+        windowsUnsafePluginHooks.length > 0 || // Stale plugin hooks still use sh/find-node on Windows
         mcpRegistrySync.claudeMissing.length > 0 ||
         mcpRegistrySync.claudeMismatched.length > 0 ||
         mcpRegistrySync.codexMissing.length > 0 ||
         mcpRegistrySync.codexMismatched.length > 0;
     // Note: Missing OMC markers is informational (normal for fresh install), not a conflict
+    // Note: workspaceMarker.precedenceConflict is a WARN, not a hard conflict
     return {
         hookConflicts,
         claudeMdStatus,
         legacySkills,
         envFlags,
         configIssues,
+        windowsUnsafePluginHooks,
         mcpRegistrySync,
+        workspaceMarker,
         hasConflicts
     };
 }
@@ -391,6 +583,18 @@ export function formatReport(report, json) {
         lines.push(`    ${colors.gray('These legacy files shadow plugin skills. Remove them or rename to avoid conflicts.')}`);
         lines.push('');
     }
+    // Windows plugin hook portability
+    if (report.windowsUnsafePluginHooks.length > 0) {
+        lines.push(colors.bold('🪟 Windows Plugin Hooks'));
+        lines.push('');
+        lines.push(`  ${colors.yellow('⚠')} Plugin hooks still route through sh/find-node on native Windows:`);
+        for (const hook of report.windowsUnsafePluginHooks) {
+            lines.push(`    - ${hook.event} ${colors.gray(`(${hook.pluginRoot})`)}`);
+            lines.push(`      ${colors.gray(hook.command)}`);
+        }
+        lines.push(`    ${colors.gray('Run /oh-my-claudecode:omc-setup or update/reinstall the plugin to rewrite hooks to direct node run.cjs commands.')}`);
+        lines.push('');
+    }
     // Config issues
     if (report.configIssues.unknownFields.length > 0) {
         lines.push(colors.bold('⚙️  Configuration Issues'));
@@ -435,6 +639,29 @@ export function formatReport(report, json) {
         else {
             lines.push(`  ${colors.green('✓')} Codex config.toml is in sync`);
         }
+    }
+    lines.push('');
+    // Workspace marker
+    lines.push(colors.bold('🗂  Workspace Marker (.omc-workspace)'));
+    lines.push('');
+    const wm = report.workspaceMarker;
+    if (wm.markerRoot) {
+        lines.push(`  ${colors.green('✓')} ${WORKSPACE_MARKER} found`);
+        lines.push(`    ${colors.gray(`Marker root: ${wm.markerRoot}`)}`);
+    }
+    else {
+        lines.push(`  ${colors.gray('ℹ')} No ${WORKSPACE_MARKER} marker found (single-repo mode)`);
+    }
+    if (wm.stateDirEnvSet) {
+        lines.push(`  ${colors.green('✓')} OMC_STATE_DIR is set: ${wm.stateDirEnvValue}`);
+    }
+    else {
+        lines.push(`  ${colors.gray('ℹ')} OMC_STATE_DIR not set`);
+    }
+    if (wm.precedenceConflict) {
+        lines.push(`  ${colors.yellow('⚠')} Both OMC_STATE_DIR and ${WORKSPACE_MARKER} are active.`);
+        lines.push(`    ${colors.gray('OMC_STATE_DIR takes precedence (resolution order: OMC_STATE_DIR > .omc-workspace > git > cwd).')}`);
+        lines.push(`    ${colors.gray('If you intended .omc-workspace to anchor state, unset OMC_STATE_DIR.')}`);
     }
     lines.push('');
     // Summary

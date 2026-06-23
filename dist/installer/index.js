@@ -7,8 +7,8 @@
  * Cross-platform support via Node.js-based hook scripts (.mjs).
  * Bash hook scripts were removed in v3.9.0.
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync, statSync } from 'fs';
+import { join, dirname, resolve, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
@@ -21,6 +21,7 @@ import { isSkininthegamebrosUser } from '../utils/skininthegamebros-user.js';
 import { syncUnifiedMcpRegistryTargets } from './mcp-registry.js';
 import { OMC_CONFIG_FILE_REL } from '../lib/paths.js';
 import { buildHudWrapper } from '../lib/hud-wrapper-template.js';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 import { syncOmcLearnedUserSkillsForClaudeCode } from '../utils/user-skill-compat.js';
 /** Claude Code configuration directory */
 export const CLAUDE_CONFIG_DIR = getClaudeConfigDir();
@@ -32,6 +33,8 @@ export const HUD_DIR = join(CLAUDE_CONFIG_DIR, 'hud');
 export const SETTINGS_FILE = join(CLAUDE_CONFIG_DIR, 'settings.json');
 export const VERSION_FILE = join(CLAUDE_CONFIG_DIR, '.omc-version.json');
 const OMC_MANAGED_SKILL_MARKER = '.omc-managed';
+const PLUGIN_FULL_SKILL_BODIES_DIR = 'skill-bodies';
+const PLUGIN_COMPACT_SKILL_SHIM_MARKER = '<!-- OMC:COMPACT-PLUGIN-SKILL -->';
 /**
  * Core commands - DISABLED for v3.0+
  * All commands are now plugin-scoped skills managed by Claude Code.
@@ -58,6 +61,12 @@ const SKININTHEGAMEBROS_ONLY_SKILLS = new Set([
     'verify',
     'debug',
 ]);
+function currentAgentsDir() {
+    return join(getClaudeConfigDir(), 'agents');
+}
+function currentSkillsDir() {
+    return join(getClaudeConfigDir(), 'skills');
+}
 /**
  * Detects the newest installed OMC version from persistent metadata or
  * existing CLAUDE.md markers so an older CLI package cannot overwrite a
@@ -586,11 +595,12 @@ function mergeHookGroups(eventType, existingGroups, newOmcGroups, options, log, 
  * known OMC agent) are preserved.
  */
 export function cleanupStaleAgents(log) {
-    if (!existsSync(AGENTS_DIR))
+    const agentsDir = currentAgentsDir();
+    if (!existsSync(agentsDir))
         return [];
     const currentAgentFiles = new Set(Object.keys(loadAgentDefinitions()));
     const removed = [];
-    for (const file of readdirSync(AGENTS_DIR)) {
+    for (const file of readdirSync(agentsDir)) {
         if (!file.endsWith('.md'))
             continue;
         if (file === 'AGENTS.md')
@@ -598,7 +608,7 @@ export function cleanupStaleAgents(log) {
         if (currentAgentFiles.has(file))
             continue;
         // Check if this looks like an OMC-created agent (kebab-case .md with frontmatter)
-        const filepath = join(AGENTS_DIR, file);
+        const filepath = join(agentsDir, file);
         try {
             const content = readFileSync(filepath, 'utf-8');
             if (content.startsWith('---\n') && /^name:\s+\S+/m.test(content)) {
@@ -622,11 +632,12 @@ export function cleanupStaleAgents(log) {
  * filename matches a current package agent.
  */
 export function prunePluginDuplicateAgents(log) {
-    if (!existsSync(AGENTS_DIR))
+    const agentsDir = currentAgentsDir();
+    if (!existsSync(agentsDir))
         return [];
     const currentAgentFiles = new Set(Object.keys(loadAgentDefinitions()));
     const removed = [];
-    for (const file of readdirSync(AGENTS_DIR)) {
+    for (const file of readdirSync(agentsDir)) {
         if (!file.endsWith('.md'))
             continue;
         if (file === 'AGENTS.md')
@@ -634,7 +645,7 @@ export function prunePluginDuplicateAgents(log) {
         // Only prune agents whose name matches a current package agent
         if (!currentAgentFiles.has(file))
             continue;
-        const filepath = join(AGENTS_DIR, file);
+        const filepath = join(agentsDir, file);
         try {
             const content = readFileSync(filepath, 'utf-8');
             if (content.startsWith('---\n') && /^name:\s+\S+/m.test(content)) {
@@ -657,7 +668,8 @@ export function prunePluginDuplicateAgents(log) {
  * the current package version. User-created skills are preserved.
  */
 export function cleanupStaleSkills(log) {
-    if (!existsSync(SKILLS_DIR))
+    const skillsDir = currentSkillsDir();
+    if (!existsSync(skillsDir))
         return [];
     const packageSkillsDir = join(getPackageDir(), 'skills');
     const currentSkillNames = new Set();
@@ -678,14 +690,14 @@ export function cleanupStaleSkills(log) {
         }
     }
     const removed = [];
-    for (const entry of readdirSync(SKILLS_DIR, { withFileTypes: true })) {
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
         if (!entry.isDirectory())
             continue;
         if (currentSkillNames.has(entry.name))
             continue;
         if (entry.name === 'omc-learned')
             continue;
-        const skillDir = join(SKILLS_DIR, entry.name);
+        const skillDir = join(skillsDir, entry.name);
         const skillMdPath = join(skillDir, 'SKILL.md');
         if (!existsSync(skillMdPath))
             continue;
@@ -712,7 +724,8 @@ export function cleanupStaleSkills(log) {
  * skills that happen to share a name.
  */
 export function prunePluginDuplicateSkills(log) {
-    if (!existsSync(SKILLS_DIR))
+    const skillsDir = currentSkillsDir();
+    if (!existsSync(skillsDir))
         return [];
     const packageSkillsDir = join(getPackageDir(), 'skills');
     if (!existsSync(packageSkillsDir))
@@ -742,7 +755,7 @@ export function prunePluginDuplicateSkills(log) {
         }
     }
     const removed = [];
-    for (const entry of readdirSync(SKILLS_DIR, { withFileTypes: true })) {
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
         if (!entry.isDirectory())
             continue;
         if (entry.name === 'omc-learned' || entry.name === '.omc-trash')
@@ -750,7 +763,7 @@ export function prunePluginDuplicateSkills(log) {
         // Only prune skills whose name matches a plugin-provided skill
         if (!pluginSkillNames.has(entry.name))
             continue;
-        const skillMdPath = join(SKILLS_DIR, entry.name, 'SKILL.md');
+        const skillMdPath = join(skillsDir, entry.name, 'SKILL.md');
         if (!existsSync(skillMdPath))
             continue;
         try {
@@ -760,7 +773,7 @@ export function prunePluginDuplicateSkills(log) {
             // .omc-managed marker file. Frontmatter structure alone is not a reliable
             // ownership signal — user skills routinely use the same ---/name: format.
             const pluginContent = pluginSkillHashes.get(entry.name);
-            const skillDir = join(SKILLS_DIR, entry.name);
+            const skillDir = join(skillsDir, entry.name);
             if (pluginContent === standaloneContent || isOmcManagedSkillDir(skillDir)) {
                 rmSync(skillDir, { recursive: true, force: true });
                 removed.push(entry.name);
@@ -778,7 +791,15 @@ function directoryHasMarkdownFiles(directory) {
         return false;
     }
     try {
-        return readdirSync(directory).some(file => file.endsWith('.md'));
+        return readdirSync(directory, { withFileTypes: true }).some(entry => entry.isFile() && entry.name.endsWith('.md'));
+    }
+    catch {
+        return false;
+    }
+}
+function isRegularFile(path) {
+    try {
+        return statSync(path).isFile();
     }
     catch {
         return false;
@@ -831,6 +852,7 @@ const PLUGIN_SYNC_PAYLOAD = [
     'scripts',
     'skills',
     'agents',
+    'commands',
     'templates',
     'docs',
     '.claude-plugin',
@@ -839,6 +861,119 @@ const PLUGIN_SYNC_PAYLOAD = [
     'LICENSE',
     'package.json',
 ];
+const REQUIRED_PLUGIN_PAYLOAD_FILES = [
+    '.claude-plugin/plugin.json',
+    'package.json',
+    'dist/hooks/skill-bridge.cjs',
+    'bridge/cli.cjs',
+    'hooks/hooks.json',
+];
+const REQUIRED_PLUGIN_COMMAND_FILES = [
+    'commands/omc-setup.md',
+];
+function readPluginManifest(root) {
+    const manifestPath = join(root, '.claude-plugin', 'plugin.json');
+    if (!existsSync(manifestPath)) {
+        return { manifest: null, errors: [] };
+    }
+    try {
+        const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return { manifest: null, errors: ['Invalid plugin manifest: .claude-plugin/plugin.json must be a JSON object'] };
+        }
+        return { manifest: parsed, errors: [] };
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { manifest: null, errors: [`Invalid plugin manifest: .claude-plugin/plugin.json: ${message}`] };
+    }
+}
+function normalizePluginRelPath(value) {
+    return value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+}
+function isSafePluginRelPath(value) {
+    const normalized = normalizePluginRelPath(value);
+    return normalized.length > 0
+        && !isAbsolute(value)
+        && !/^[A-Za-z]:[\\/]/.test(value)
+        && !normalized.split('/').includes('..');
+}
+function validatePluginManifestSchema(root, manifest) {
+    const errors = [];
+    if (!manifest) {
+        return errors;
+    }
+    if (typeof manifest.name !== 'string' || manifest.name.trim().length === 0) {
+        errors.push('Invalid plugin manifest: .claude-plugin/plugin.json name must be a non-empty string');
+    }
+    if (typeof manifest.commands !== 'string' || manifest.commands.trim().length === 0) {
+        errors.push('Invalid plugin manifest: .claude-plugin/plugin.json commands must be a non-empty relative path');
+    }
+    else if (!isSafePluginRelPath(manifest.commands)) {
+        errors.push('Invalid plugin manifest: .claude-plugin/plugin.json commands must stay inside the plugin root');
+    }
+    else if (!directoryHasMarkdownFiles(join(root, normalizePluginRelPath(manifest.commands)))) {
+        errors.push(`Missing declared plugin command markdown files in ${normalizePluginRelPath(manifest.commands)}/`);
+    }
+    if (!Array.isArray(manifest.skills) || manifest.skills.length === 0) {
+        errors.push('Invalid plugin manifest: .claude-plugin/plugin.json skills must be a non-empty array');
+    }
+    return errors;
+}
+function validateDeclaredPluginSkills(root, manifest) {
+    const errors = [];
+    const declaredSkills = manifest?.skills;
+    if (!Array.isArray(declaredSkills)) {
+        return errors;
+    }
+    for (const declaredSkill of declaredSkills) {
+        if (typeof declaredSkill !== 'string' || declaredSkill.trim().length === 0) {
+            errors.push('Invalid plugin skill declaration in .claude-plugin/plugin.json');
+            continue;
+        }
+        if (!isSafePluginRelPath(declaredSkill)) {
+            errors.push(`Invalid plugin skill declaration outside plugin root: ${declaredSkill}`);
+            continue;
+        }
+        const relPath = normalizePluginRelPath(declaredSkill);
+        const skillPath = relPath.endsWith('/SKILL.md') ? relPath : `${relPath}/SKILL.md`;
+        if (!isRegularFile(join(root, skillPath))) {
+            errors.push(`Missing declared plugin skill file: ${skillPath}`);
+        }
+    }
+    return errors;
+}
+function validatePluginSyncPayload(root) {
+    const errors = [];
+    for (const relPath of REQUIRED_PLUGIN_PAYLOAD_FILES) {
+        if (!isRegularFile(join(root, relPath))) {
+            errors.push(`Missing required plugin payload file: ${relPath}`);
+        }
+    }
+    for (const relPath of REQUIRED_PLUGIN_COMMAND_FILES) {
+        if (!isRegularFile(join(root, relPath))) {
+            errors.push(`Missing required plugin command file: ${relPath}`);
+        }
+    }
+    if (!directoryHasMarkdownFiles(join(root, 'commands'))) {
+        errors.push('Missing required plugin command markdown files in commands/');
+    }
+    if (!directoryHasSkillDefinitions(join(root, 'skills'))) {
+        errors.push('Missing required plugin skill definitions in skills/');
+    }
+    const manifestResult = readPluginManifest(root);
+    errors.push(...manifestResult.errors);
+    errors.push(...validatePluginManifestSchema(root, manifestResult.manifest));
+    errors.push(...validateDeclaredPluginSkills(root, manifestResult.manifest));
+    return errors;
+}
+export function validatePluginCachePayload(root) {
+    const errors = validatePluginSyncPayload(root);
+    return { valid: errors.length === 0, errors };
+}
+function hasCompletePluginPayload(root) {
+    return validatePluginSyncPayload(root).length === 0;
+}
 function countPluginSyncPayloadEntries(root) {
     let score = 0;
     for (const entry of PLUGIN_SYNC_PAYLOAD) {
@@ -913,6 +1048,7 @@ function resolveBestPluginSyncSource(targetRoots) {
         getRuntimePackageRoot(),
     ];
     let bestRoot = null;
+    const errors = [];
     let bestScore = -1;
     let bestOrder = Number.POSITIVE_INFINITY;
     for (const [order, candidate] of candidates.entries()) {
@@ -921,6 +1057,11 @@ function resolveBestPluginSyncSource(targetRoots) {
             continue;
         }
         seen.add(normalizedCandidate);
+        const sourceValidationErrors = validatePluginSyncPayload(candidate);
+        if (sourceValidationErrors.length > 0) {
+            errors.push(...sourceValidationErrors.map(error => `${candidate}: ${error}`));
+            continue;
+        }
         const score = countPluginSyncPayloadEntries(candidate);
         if (score === 0) {
             continue;
@@ -931,16 +1072,113 @@ function resolveBestPluginSyncSource(targetRoots) {
             bestOrder = order;
         }
     }
-    return bestRoot;
+    return { sourceRoot: bestRoot, errors: bestRoot ? [] : errors };
+}
+function extractFrontmatterBlock(content) {
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    return match?.[1] ?? null;
+}
+function getFrontmatterStringValue(metadata, key) {
+    const value = metadata[key];
+    return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+function normalizeCompactSkillDescription(description) {
+    const normalized = description.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= 240) {
+        return normalized;
+    }
+    return `${normalized.slice(0, 237).trimEnd()}...`;
+}
+function upsertYamlStringField(frontmatter, key, value) {
+    const escaped = JSON.stringify(value);
+    const line = `${key}: ${escaped}`;
+    const pattern = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:.*$`, 'm');
+    if (pattern.test(frontmatter)) {
+        return frontmatter.replace(pattern, line);
+    }
+    return `${frontmatter.trimEnd()}\n${line}`;
+}
+function renderCompactPluginSkillShim(skillDirName, content) {
+    const parsed = parseFrontmatter(content);
+    let frontmatter = extractFrontmatterBlock(content) ?? `name: ${skillDirName}`;
+    const rawDescription = getFrontmatterStringValue(parsed.metadata, 'short_description')
+        ?? getFrontmatterStringValue(parsed.metadata, 'description')
+        ?? `Invoke the ${skillDirName} OMC skill.`;
+    const description = normalizeCompactSkillDescription(rawDescription);
+    const fullBodyRelPath = `../../${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md`;
+    frontmatter = upsertYamlStringField(frontmatter, 'description', description);
+    frontmatter = upsertYamlStringField(frontmatter, 'omc-full-body', fullBodyRelPath);
+    return `---\n${frontmatter.trim()}\n---\n\n${PLUGIN_COMPACT_SKILL_SHIM_MARKER}\n\n# ${skillDirName}\n\nThis is a compact Claude Code plugin registry shim. It keeps startup skill descriptions small while preserving the full OMC skill body for on-demand invocation.\n\nWhen this skill is invoked, read and follow the full bundled instructions from the active plugin root:\n\n\`${'${CLAUDE_PLUGIN_ROOT:-${OMC_PLUGIN_ROOT}}'}/${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\`\n\nThe plugin root is the directory containing both \`skills/\` and \`${PLUGIN_FULL_SKILL_BODIES_DIR}/\`. Do not resolve \`${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\` under this shim's \`skills/${skillDirName}/\` directory; \`${PLUGIN_FULL_SKILL_BODIES_DIR}/\` is a direct child of the plugin root. The same archived body path is recorded in frontmatter as \`omc-full-body: ${fullBodyRelPath}\` for hosts that understand plugin-root-relative metadata.\n`;
+}
+export function compactPluginSkillPayload(targetRoot) {
+    const skillsDir = join(targetRoot, 'skills');
+    const fullBodiesDir = join(targetRoot, PLUGIN_FULL_SKILL_BODIES_DIR);
+    const errors = [];
+    let compacted = 0;
+    let totalBytes = 0;
+    if (!existsSync(skillsDir)) {
+        return { compacted, totalBytes, errors };
+    }
+    try {
+        mkdirSync(fullBodiesDir, { recursive: true });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { compacted, totalBytes, errors: [`Failed to create ${fullBodiesDir}: ${message}`] };
+    }
+    const skillEntries = (() => {
+        try {
+            return readdirSync(skillsDir, { withFileTypes: true });
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`Failed to read plugin skills from ${skillsDir}: ${message}`);
+            return null;
+        }
+    })();
+    if (!skillEntries) {
+        return { compacted, totalBytes, errors };
+    }
+    for (const entry of skillEntries) {
+        if (!entry.isDirectory())
+            continue;
+        const skillDir = join(skillsDir, entry.name);
+        const skillPath = join(skillDir, 'SKILL.md');
+        if (!existsSync(skillPath))
+            continue;
+        try {
+            const content = readFileSync(skillPath, 'utf-8');
+            const archivedSkillDir = join(fullBodiesDir, entry.name);
+            rmSync(archivedSkillDir, { recursive: true, force: true });
+            cpSync(skillDir, archivedSkillDir, { recursive: true, force: true });
+            const shim = renderCompactPluginSkillShim(entry.name, content);
+            writeFileSync(skillPath, shim);
+            totalBytes += Buffer.byteLength(shim, 'utf-8');
+            compacted += 1;
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`Failed to compact plugin skill ${entry.name}: ${message}`);
+        }
+    }
+    return { compacted, totalBytes, errors };
 }
 export function copyPluginSyncPayload(sourceRoot, targetRoots) {
     if (targetRoots.length === 0) {
         return { synced: false, errors: [] };
     }
+    const sourceValidationErrors = validatePluginSyncPayload(sourceRoot);
+    if (sourceValidationErrors.length > 0) {
+        return {
+            synced: false,
+            errors: sourceValidationErrors.map(error => `${sourceRoot}: ${error}`),
+        };
+    }
     let synced = false;
     const errors = [];
     for (const targetRoot of targetRoots) {
         let copiedToTarget = false;
+        let copiedSkills = false;
         for (const entry of PLUGIN_SYNC_PAYLOAD) {
             const sourcePath = join(sourceRoot, entry);
             if (!existsSync(sourcePath)) {
@@ -952,13 +1190,22 @@ export function copyPluginSyncPayload(sourceRoot, targetRoots) {
                     force: true,
                 });
                 copiedToTarget = true;
+                copiedSkills = copiedSkills || entry === 'skills';
             }
             catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
                 errors.push(`Failed to sync ${entry} to ${targetRoot}: ${message}`);
             }
         }
-        synced = synced || copiedToTarget;
+        if (copiedSkills) {
+            const compactResult = compactPluginSkillPayload(targetRoot);
+            errors.push(...compactResult.errors);
+        }
+        if (copiedToTarget) {
+            const targetValidationErrors = validatePluginSyncPayload(targetRoot);
+            errors.push(...targetValidationErrors.map(error => `${targetRoot}: ${error}`));
+        }
+        synced = synced || (copiedToTarget && !errors.some(error => error.startsWith(`${targetRoot}: `)));
     }
     return { synced, errors };
 }
@@ -968,11 +1215,15 @@ export function syncInstalledPluginPayload() {
     if (targetRoots.length === 0) {
         return { synced: false, errors: [], sourceRoot: null, targetRoots: [] };
     }
-    const sourceRoot = resolveBestPluginSyncSource(targetRoots);
+    const sourceResolution = resolveBestPluginSyncSource(targetRoots);
+    const sourceRoot = sourceResolution.sourceRoot;
     if (!sourceRoot) {
         return {
             synced: false,
-            errors: ['Unable to find a complete OMC package source to repair installed plugin roots'],
+            errors: [
+                'Unable to find a complete OMC package source to repair installed plugin roots',
+                ...sourceResolution.errors,
+            ],
             sourceRoot: null,
             targetRoots,
         };
@@ -985,13 +1236,13 @@ export function syncInstalledPluginPayload() {
  * markdown files, so the legacy ~/.claude/agents copy can be skipped.
  */
 export function hasPluginProvidedAgentFiles() {
-    return getInstalledOmcPluginRoots().some(pluginRoot => directoryHasMarkdownFiles(join(pluginRoot, 'agents')));
+    return getInstalledOmcPluginRoots().some(pluginRoot => hasCompletePluginPayload(pluginRoot) && directoryHasMarkdownFiles(join(pluginRoot, 'agents')));
 }
 export function hasPluginProvidedSkillFiles() {
-    return getInstalledOmcPluginRoots().some(pluginRoot => directoryHasSkillDefinitions(join(pluginRoot, 'skills')));
+    return getInstalledOmcPluginRoots().some(pluginRoot => hasCompletePluginPayload(pluginRoot) && directoryHasSkillDefinitions(join(pluginRoot, 'skills')));
 }
 export function hasPluginProvidedHookFiles() {
-    return getInstalledOmcPluginRoots().some(pluginRoot => existsSync(join(pluginRoot, 'hooks', 'hooks.json')));
+    return getInstalledOmcPluginRoots().some(pluginRoot => hasCompletePluginPayload(pluginRoot) && existsSync(join(pluginRoot, 'hooks', 'hooks.json')));
 }
 export function hasEnabledOmcPlugin() {
     if (process.env.CLAUDE_PLUGIN_ROOT?.trim()) {
@@ -1337,7 +1588,12 @@ export function install(options = {}) {
     const pluginPayloadSync = syncInstalledPluginPayload();
     if (pluginPayloadSync.errors.length > 0) {
         for (const error of pluginPayloadSync.errors) {
-            log(`Plugin cache sync warning: ${error}`);
+            log(`Plugin cache sync error: ${error}`);
+        }
+        if (pluginPayloadSync.targetRoots.length > 0) {
+            result.errors.push(...pluginPayloadSync.errors.map(error => `Plugin cache sync failed: ${error}`));
+            result.message = 'Installation failed: OMC plugin cache is incomplete and could not be repaired';
+            return result;
         }
     }
     if (pluginPayloadSync.synced) {
@@ -1670,6 +1926,22 @@ export function install(options = {}) {
             };
             writeFileSync(VERSION_FILE, JSON.stringify(versionMetadata, null, 2));
             log('Saved version metadata');
+            // Write workspace-level template-version stamp for drift detection in session-start
+            try {
+                const omcRoot = getOmcRoot();
+                mkdirSync(omcRoot, { recursive: true });
+                const templateVersionStamp = {
+                    version: targetVersion,
+                    installedAt: new Date().toISOString(),
+                    pluginRoot: process.env.CLAUDE_PLUGIN_ROOT ?? null
+                };
+                writeFileSync(join(omcRoot, 'template-version.json'), JSON.stringify(templateVersionStamp, null, 2));
+                log('Saved template-version stamp');
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                log(`  Warning: Could not write template-version stamp (non-fatal): ${message}`);
+            }
         }
         else {
             log('Skipping version metadata (project-scoped plugin)');

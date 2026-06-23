@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
-import { basename, join } from 'path';
+import { basename, dirname, join } from 'path';
 import { resolvePluginDirArg } from '../lib/plugin-dir.js';
 import { stripRetiredTeamMcpServers } from '../installer/mcp-registry.js';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
@@ -32,6 +32,7 @@ import {
   quoteShellArg,
   tmuxExec,
 } from './tmux-utils.js';
+import { configureTmuxClipboardForCurrentSession, configureTmuxClipboardForSession } from './tmux-clipboard.js';
 import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { OMC_CONFIG_FILE_REL } from '../lib/paths.js';
 
@@ -53,7 +54,11 @@ function hasOmcMarkers(path: string): boolean {
   return content.includes('<!-- OMC:START -->') && content.includes('<!-- OMC:END -->');
 }
 
-function ensureMirroredPath(sourcePath: string, targetPath: string): void {
+function ensureMirroredPath(
+  sourcePath: string,
+  targetPath: string,
+  options: { allowCopyFallback?: boolean } = {},
+): void {
   if (!existsSync(sourcePath)) return;
 
   try {
@@ -74,6 +79,10 @@ function ensureMirroredPath(sourcePath: string, targetPath: string): void {
 
     symlinkSync(sourcePath, targetPath, 'file');
   } catch {
+    if (options.allowCopyFallback === false) {
+      return;
+    }
+
     const sourceStat = lstatSync(sourcePath);
     if (sourceStat.isDirectory()) {
       cpSync(sourcePath, targetPath, { recursive: true });
@@ -81,6 +90,31 @@ function ensureMirroredPath(sourcePath: string, targetPath: string): void {
     }
     copyFileSync(sourcePath, targetPath);
   }
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readJsonObject(path: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
+    return isJsonObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function refreshRuntimeClaudeJsonMcpServers(baseConfigDir: string, runtimeClaudeJsonPath: string): void {
+  const sourceClaudeJsonPath = join(dirname(baseConfigDir), '.claude.json');
+  const sourceClaudeJson = readJsonObject(sourceClaudeJsonPath);
+  if (!sourceClaudeJson || !isJsonObject(sourceClaudeJson.mcpServers)) {
+    return;
+  }
+
+  const runtimeClaudeJson = readJsonObject(runtimeClaudeJsonPath) ?? {};
+  runtimeClaudeJson.mcpServers = sourceClaudeJson.mcpServers;
+  writeFileSync(runtimeClaudeJsonPath, JSON.stringify(runtimeClaudeJson, null, 2));
 }
 
 export function prepareOmcLaunchConfigDir(baseConfigDir = getClaudeConfigDir()): string {
@@ -100,6 +134,7 @@ export function prepareOmcLaunchConfigDir(baseConfigDir = getClaudeConfigDir()):
   if (preservedClaudeJson) {
     writeFileSync(runtimeClaudeJsonPath, preservedClaudeJson);
   }
+  refreshRuntimeClaudeJsonMcpServers(baseConfigDir, runtimeClaudeJsonPath);
   copyFileSync(companionPath, join(runtimeConfigDir, 'CLAUDE.md'));
 
   for (const entry of [
@@ -111,14 +146,20 @@ export function prepareOmcLaunchConfigDir(baseConfigDir = getClaudeConfigDir()):
     'projects',
     'rules',
     'skills',
+    'themes',
     OMC_CONFIG_FILE_REL,
     '.omc-version.json',
     '.omc-silent-update.json',
     'keybindings.json',
     'settings.json',
     'settings.local.json',
+    '.credentials.json',
   ]) {
-    ensureMirroredPath(join(baseConfigDir, entry), join(runtimeConfigDir, basename(entry)));
+    ensureMirroredPath(
+      join(baseConfigDir, entry),
+      join(runtimeConfigDir, basename(entry)),
+      { allowCopyFallback: entry !== '.credentials.json' },
+    );
   }
 
   const runtimeSettingsPath = join(runtimeConfigDir, 'settings.json');
@@ -467,7 +508,11 @@ export function runClaude(cwd: string, args: string[], sessionId: string): void 
  * Launches Claude in current pane
  */
 function runClaudeInsideTmux(cwd: string, args: string[]): void {
-  // Enable mouse scrolling in the current tmux session (non-fatal if it fails)
+  // Enable OSC 52 clipboard forwarding and mouse scrolling in the current tmux session (non-fatal if unsupported).
+  try {
+    configureTmuxClipboardForCurrentSession({ stdio: 'ignore' });
+  } catch { /* non-fatal — user's tmux may not support these options */ }
+
   try {
     tmuxExec(['set-option', 'mouse', 'on'], { stdio: 'ignore' });
   } catch { /* non-fatal — user's tmux may not support these options */ }
@@ -563,6 +608,12 @@ function runClaudeOutsideTmux(
     }
     runClaudeDirect(cwd, args);
     return;
+  }
+
+  try {
+    configureTmuxClipboardForSession(sessionName, { stripTmux: true, stdio: 'ignore' });
+  } catch {
+    /* non-fatal — user's tmux may not support these options */
   }
 
   try {
@@ -717,7 +768,7 @@ export async function launchCommand(args: string[]): Promise<void> {
   // Pre-flight: check claude CLI availability
   if (!isClaudeAvailable()) {
     console.error('[omc] Error: claude CLI not found. Install Claude Code first:');
-    console.error('  npm install -g @anthropic-ai/claude-code');
+    console.error('  https://code.claude.com/docs/en/setup');
     process.exit(1);
   }
 

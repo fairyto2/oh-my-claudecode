@@ -254,7 +254,7 @@ Coordinates N Claude agents with a 5-stage pipeline: `plan → prd → exec → 
 ```
 
 #### ccg (Claude-Codex-Gemini)
-Fans out to Codex and Gemini simultaneously; Claude synthesizes the results.
+Fans out to Codex and Gemini simultaneously; Claude synthesizes the results. Use `antigravity` workers in place of `gemini` when using the Antigravity CLI (Google's successor to the Gemini CLI).
 - Trigger: `ccg`, `claude-codex-gemini`
 ```bash
 ccg: review this authentication implementation
@@ -280,7 +280,7 @@ ralplan this feature
 | `trace` | Evidence-driven causal tracing | `/oh-my-claudecode:trace` |
 | `release` | Automated release workflow | `/oh-my-claudecode:release` |
 | `deepinit` | Generate hierarchical AGENTS.md | `/oh-my-claudecode:deepinit` |
-| `deep-interview` | Socratic deep interview | `/oh-my-claudecode:deep-interview` |
+| `deep-interview` | Socratic deep interview | `/deep-interview` |
 | `sciomc` | Parallel scientist agent orchestration | `/oh-my-claudecode:sciomc` |
 | `external-context` | Parallel document-specialist research | `/oh-my-claudecode:external-context` |
 | `ai-slop-cleaner` | Clean AI expression patterns | `/oh-my-claudecode:ai-slop-cleaner` |
@@ -293,7 +293,7 @@ ralplan this feature
 | `ultrawork`, `ulw`, `uw` | Parallel agent orchestration |
 | `autopilot`, `build me`, `I want a`, `handle it all`, `end to end`, `e2e this` | Autonomous execution pipeline |
 | `ralph`, `don't stop`, `must complete`, `until done` | Loop until verified complete |
-| `ccg`, `claude-codex-gemini` | 3-model orchestration |
+| `ccg`, `claude-codex-gemini` | 3-model orchestration (use `antigravity` workers when using the Antigravity CLI) |
 | `ralplan` | Consensus-based planning |
 | `deep interview`, `ouroboros` | Socratic deep interview |
 | `code review`, `review code` | Comprehensive code review mode |

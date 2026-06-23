@@ -40,6 +40,12 @@ export interface PersistentModeResult {
 }
 export declare function shouldWriteStateBack(statePath: string | null | undefined): boolean;
 /**
+ * Pending owned async work (background Bash/Task or an armed wakeup) means the
+ * agent is legitimately waiting for an external notification/resume. In that
+ * window persistent modes should not inject a "stalled" reinforcement.
+ */
+export declare function hasPendingOwnedAsyncWork(directory: string, sessionId?: string): boolean;
+/**
  * Read last tool error from state directory.
  * Returns null if file doesn't exist or error is stale (>60 seconds old).
  */
@@ -78,8 +84,10 @@ export declare function shouldSendIdleNotification(stateDir: string, sessionId?:
  */
 export declare function recordIdleNotificationSent(stateDir: string, sessionId?: string, repoState?: IdleNotificationRepoState | null): void;
 /**
- * Main persistent mode checker
- * Checks all persistent modes in priority order and returns appropriate action
+ * Main persistent mode checker.
+ * Resolves which mode (if any) should block, then applies the thinking-only
+ * streak guard so an active mode cannot loop forever re-injecting continuation
+ * prompts while the agent only emits thinking blocks and never tool_use (#3280).
  */
 export declare function checkPersistentModes(sessionId?: string, directory?: string, stopContext?: StopContext): Promise<PersistentModeResult>;
 /**

@@ -17,6 +17,7 @@ import {
   buildWorkerArgv,
   getWorkerEnv as getModelWorkerEnv,
   resolveClaudeWorkerModel,
+  assertHeadlessSupported,
   type CliAgentType,
 } from './model-contract.js';
 import { CANONICAL_TEAM_ROLES } from '../shared/types.js';
@@ -54,7 +55,7 @@ import {
 // ── Environment gate ──────────────────────────────────────────────────────────
 
 const OMC_TEAM_SCALING_ENABLED_ENV = 'OMC_TEAM_SCALING_ENABLED';
-const CLI_AGENT_TYPES = new Set<CliAgentType>(['claude', 'codex', 'gemini']);
+const CLI_AGENT_TYPES = new Set<CliAgentType>(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity']);
 
 export function isScalingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[OMC_TEAM_SCALING_ENABLED_ENV];
@@ -79,6 +80,39 @@ function asCliAgentType(agentType: string): CliAgentType {
   throw new Error(
     `Unknown agent type: ${agentType}. Supported: ${Array.from(CLI_AGENT_TYPES).join(', ')}`,
   );
+}
+
+function configuredTmuxTarget(tmuxSession: unknown): { expectedTarget: string; format: string } {
+  const expectedTarget = typeof tmuxSession === 'string' ? tmuxSession.trim() : '';
+  return {
+    expectedTarget,
+    format: expectedTarget.includes(':') ? '#{session_name}:#{window_index}' : '#{session_name}',
+  };
+}
+
+function validateSplitTargetPaneInConfiguredSession(splitTarget: string, tmuxSession: unknown): string | null {
+  const { expectedTarget, format } = configuredTmuxTarget(tmuxSession);
+  if (!splitTarget.trim()) {
+    return 'Refusing to split tmux pane: missing leader/worker pane target.';
+  }
+  if (!expectedTarget) {
+    return `Refusing to split tmux pane ${splitTarget}: missing configured tmux_session.`;
+  }
+
+  const result = tmuxSpawn(['display-message', '-t', splitTarget, '-p', format]);
+  if (result.status !== 0) {
+    const reason = (result.stderr || '').trim()
+      || (result.error instanceof Error ? result.error.message : undefined)
+      || `tmux display-message exited with status ${result.status}`;
+    return `Refusing to split tmux pane ${splitTarget}: unable to validate pane belongs to configured tmux_session ${expectedTarget} (${reason}).`;
+  }
+
+  const actualTarget = (result.stdout || '').trim().split('\n')[0]?.trim() ?? '';
+  if (actualTarget !== expectedTarget) {
+    return `Refusing to split tmux pane ${splitTarget}: pane belongs to tmux target ${actualTarget || '<unknown>'}, expected ${expectedTarget}.`;
+  }
+
+  return null;
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -225,6 +259,18 @@ export async function scaleUp(
         };
       }
 
+      // Validate the tmux split target before creating worker directories,
+      // worktrees, or overlays so a stale/malformed pane id cannot cause side
+      // effects in the wrong live tmux session.
+      const splitTarget = config.workers.length > 0
+        ? (config.workers[config.workers.length - 1]?.pane_id ?? config.leader_pane_id ?? '')
+        : (config.leader_pane_id ?? '');
+      const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
+      const splitTargetError = validateSplitTargetPaneInConfiguredSession(splitTarget, config.tmux_session);
+      if (splitTargetError) {
+        return await rollbackScaleUp(splitTargetError);
+      }
+
       // Create worker directory
       const workerDirPath = absPath(leaderCwd, TeamPaths.workerDir(sanitized, workerName));
       await mkdir(workerDirPath, { recursive: true });
@@ -289,6 +335,10 @@ export async function scaleUp(
         agentType: CliAgentType,
         model: string | undefined,
       ): { launchBinary: string; launchArgs: string[] } => {
+        // Platform guard (parity with startTeamV2 preflight): a headless-unsupported
+        // provider (e.g. antigravity on Windows) throws here so scale-up falls back
+        // to the routed Claude fallback instead of spawning an unusable primary.
+        assertHeadlessSupported(agentType);
         const [launchBinary, ...launchArgs] = buildWorkerArgv(agentType, {
           teamName: sanitized,
           workerName,
@@ -381,13 +431,7 @@ export async function scaleUp(
         );
       }
 
-
       // Split from the rightmost worker pane or the leader pane
-      const splitTarget = config.workers.length > 0
-        ? (config.workers[config.workers.length - 1]?.pane_id ?? config.leader_pane_id ?? '')
-        : (config.leader_pane_id ?? '');
-      const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
-
       const result = tmuxSpawn([
         'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
       ]);

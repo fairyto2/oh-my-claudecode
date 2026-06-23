@@ -6,7 +6,8 @@
  */
 
 import { z } from 'zod';
-import { existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
 import {
   resolveStatePath,
@@ -17,13 +18,16 @@ import {
   listSessionIds,
   validateSessionId,
   getOmcRoot,
+  OmcPaths,
 } from '../lib/worktree-paths.js';
+import { resolveSessionId } from '../lib/session-id.js';
 import { atomicWriteJsonSync } from '../lib/atomic-write.js';
 import { validatePayload } from '../lib/payload-limits.js';
 import {
   canClearStateForSession,
   findCompletedSessionStateFiles,
   findSessionOwnedStateFiles,
+  getStateSessionOwner,
 } from '../lib/mode-state-io.js';
 import {
   isModeActive,
@@ -54,6 +58,127 @@ const STATE_TOOL_MODES: [string, ...string[]] = [
 const EXTRA_STATE_ONLY_MODES = ['ralplan', 'omc-teams', 'skill-active'] as const;
 type StateToolMode = typeof STATE_TOOL_MODES[number];
 const CANCEL_SIGNAL_TTL_MS = 30_000;
+const OWNER_SESSION_FALLBACK_MODES = new Set<StateToolMode>(['ralph']);
+const CONVERGED_STATE_PATH_MODES = new Set<StateToolMode>(['ralph', 'ultrawork']);
+
+function getStateFileName(mode: StateToolMode): string {
+  const normalizedName = mode.endsWith('-state') ? mode : `${mode}-state`;
+  return `${normalizedName}.json`;
+}
+
+function readJsonRecord(filePath: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function listSessionIdsUnderOmcRoot(omcRoot: string): string[] {
+  const sessionsDir = join(omcRoot, 'state', 'sessions');
+  if (!existsSync(sessionsDir)) {
+    return [];
+  }
+
+  try {
+    return readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(name));
+  } catch {
+    return [];
+  }
+}
+
+function getConvergedOmcRoots(root: string): string[] {
+  const roots = new Set<string>([getOmcRoot(root)]);
+  roots.add(join(root, OmcPaths.ROOT));
+  roots.add(join(homedir(), OmcPaths.ROOT));
+  return [...roots];
+}
+
+function getConvergedStateCandidates(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): string[] {
+  if (!CONVERGED_STATE_PATH_MODES.has(mode)) {
+    return [];
+  }
+
+  const filename = getStateFileName(mode);
+  const paths = new Set<string>();
+
+  for (const omcRoot of getConvergedOmcRoots(root)) {
+    const stateDir = join(omcRoot, 'state');
+    if (sessionId) {
+      paths.add(join(stateDir, 'sessions', sessionId, filename));
+      for (const sid of listSessionIdsUnderOmcRoot(omcRoot)) {
+        const candidatePath = join(stateDir, 'sessions', sid, filename);
+        const raw = readJsonRecord(candidatePath);
+        if (raw && getStateSessionOwner(raw) === sessionId) {
+          paths.add(candidatePath);
+        }
+      }
+    } else {
+      for (const sid of listSessionIdsUnderOmcRoot(omcRoot)) {
+        paths.add(join(stateDir, 'sessions', sid, filename));
+      }
+    }
+
+    paths.add(join(stateDir, filename));
+    paths.add(join(omcRoot, filename));
+  }
+
+  return [...paths];
+}
+
+function isConvergedCandidateActiveForSession(statePath: string, sessionId?: string): boolean {
+  const raw = readJsonRecord(statePath);
+  if (!raw || raw.active !== true) {
+    return false;
+  }
+  if (!sessionId) {
+    return true;
+  }
+  return canClearStateForSession(raw, sessionId);
+}
+
+function clearConvergedStateCandidates(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): { cleared: number; hadFailure: boolean; paths: string[] } {
+  let cleared = 0;
+  let hadFailure = false;
+  const paths = getConvergedStateCandidates(mode, root, sessionId);
+
+  for (const statePath of paths) {
+    if (!existsSync(statePath)) {
+      continue;
+    }
+
+    try {
+      if (sessionId) {
+        const raw = readJsonRecord(statePath);
+        if (!canClearStateForSession(raw, sessionId)) {
+          continue;
+        }
+      }
+      unlinkSync(statePath);
+      cleared++;
+    } catch {
+      hadFailure = true;
+    }
+  }
+
+  return { cleared, hadFailure, paths };
+}
+
+function hasActiveConvergedState(mode: StateToolMode, root: string, sessionId?: string): boolean {
+  return getConvergedStateCandidates(mode, root, sessionId)
+    .some((statePath) => isConvergedCandidateActiveForSession(statePath, sessionId));
+}
 
 function readTeamNamesFromStateFile(statePath: string): string[] {
   if (!existsSync(statePath)) return [];
@@ -165,6 +290,81 @@ function getLegacyStateFileCandidates(mode: StateToolMode, root: string): string
   return [...new Set(candidates)];
 }
 
+function getWorkingDirectoryLocalOmcRoot(root: string): string {
+  return join(root, OmcPaths.ROOT);
+}
+
+function shouldCheckWorkingDirectoryLocalState(root: string): boolean {
+  return getWorkingDirectoryLocalOmcRoot(root) !== getOmcRoot(root);
+}
+
+function getWorkingDirectoryLocalSessionStatePath(mode: StateToolMode, root: string, sessionId: string): string {
+  const normalizedName = mode.endsWith('-state') ? mode : `${mode}-state`;
+  return join(getWorkingDirectoryLocalOmcRoot(root), 'state', 'sessions', sessionId, `${normalizedName}.json`);
+}
+
+function getWorkingDirectoryLocalLegacyStateFileCandidates(mode: StateToolMode, root: string): string[] {
+  const normalizedName = mode.endsWith('-state') ? mode : `${mode}-state`;
+  return [
+    join(getWorkingDirectoryLocalOmcRoot(root), 'state', `${normalizedName}.json`),
+    join(getWorkingDirectoryLocalOmcRoot(root), `${normalizedName}.json`),
+  ];
+}
+
+function getWorkingDirectoryLocalStateClearCandidates(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): string[] {
+  if (!shouldCheckWorkingDirectoryLocalState(root)) {
+    return [];
+  }
+
+  const paths = new Set<string>();
+  if (sessionId) {
+    paths.add(getWorkingDirectoryLocalSessionStatePath(mode, root, sessionId));
+  }
+
+  for (const legacyPath of getWorkingDirectoryLocalLegacyStateFileCandidates(mode, root)) {
+    paths.add(legacyPath);
+  }
+
+  return [...paths];
+}
+
+function clearWorkingDirectoryLocalStateCandidates(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): { cleared: number; hadFailure: boolean; paths: string[] } {
+  let cleared = 0;
+  let hadFailure = false;
+  const paths = getWorkingDirectoryLocalStateClearCandidates(mode, root, sessionId);
+  const localLegacyPaths = new Set(getWorkingDirectoryLocalLegacyStateFileCandidates(mode, root));
+
+  for (const statePath of paths) {
+    if (!existsSync(statePath)) {
+      continue;
+    }
+
+    try {
+      if (sessionId && localLegacyPaths.has(statePath)) {
+        const raw = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
+        if (!canClearStateForSession(raw, sessionId)) {
+          continue;
+        }
+      }
+
+      unlinkSync(statePath);
+      cleared++;
+    } catch {
+      hadFailure = true;
+    }
+  }
+
+  return { cleared, hadFailure, paths };
+}
+
 function clearLegacyStateCandidates(
   mode: StateToolMode,
   root: string,
@@ -236,6 +436,54 @@ function clearCompletedSessionStateCandidates(
   }
 
   return { cleared, hadFailure, paths };
+}
+
+
+function getStateClearCheckedPaths(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): string[] {
+  const paths = new Set<string>();
+
+  if (sessionId) {
+    paths.add(MODE_CONFIGS[mode as ExecutionMode]
+      ? getStateFilePath(root, mode as ExecutionMode, sessionId)
+      : resolveSessionStatePath(mode, sessionId, root));
+  } else {
+    paths.add(getStatePath(mode, root));
+  }
+
+  for (const legacyPath of getLegacyStateFileCandidates(mode, root)) {
+    paths.add(legacyPath);
+  }
+
+  for (const localPath of getWorkingDirectoryLocalStateClearCandidates(mode, root, sessionId)) {
+    paths.add(localPath);
+  }
+
+  const sessionIds = sessionId ? [sessionId, ...listSessionIds(root)] : listSessionIds(root);
+  for (const sid of new Set(sessionIds)) {
+    paths.add(MODE_CONFIGS[mode as ExecutionMode]
+      ? getStateFilePath(root, mode as ExecutionMode, sid)
+      : resolveSessionStatePath(mode, sid, root));
+  }
+
+  return [...paths];
+}
+
+function formatStateClearNoopMessage(
+  mode: StateToolMode,
+  root: string,
+  sessionId?: string,
+): string {
+  const scope = sessionId ? ` in session: ${sessionId}` : '';
+  const checkedPaths = getStateClearCheckedPaths(mode, root, sessionId);
+  const checked = checkedPaths.length > 0
+    ? `\n- Checked paths:\n${checkedPaths.map((statePath) => `  - ${statePath}`).join('\n')}`
+    : '';
+
+  return `No state found to clear for mode: ${mode}${scope}${checked}`;
 }
 
 function getModeRuntimeArtifactNames(mode: StateToolMode): string[] {
@@ -665,21 +913,33 @@ export const stateClearTool: ToolDefinition<{
         }
         const completedSessionCleanup = clearCompletedSessionStateCandidates(mode, root, sessionId);
         const runtimeCleanup = clearModeRuntimeArtifacts(mode, root, sessionId);
+        let convergedCleanup = { cleared: 0, hadFailure: false, paths: [] as string[] };
         writeSessionCancelSignal(root, sessionId, mode);
 
         if (MODE_CONFIGS[mode as ExecutionMode]) {
           const success = clearModeState(mode as ExecutionMode, root, sessionId);
           const sessionCleanup = clearSessionOwnedStateCandidates(mode, root, sessionId);
           const legacyCleanup = clearLegacyStateCandidates(mode, root, sessionId);
+          const shouldUseLocalFallback = requestedSessionOwnedPaths.length === 0 &&
+            completedSessionCleanup.cleared === 0 &&
+            sessionCleanup.cleared === 0 &&
+            legacyCleanup.cleared === 0;
+          const workingDirectoryLocalCleanup = shouldUseLocalFallback
+            ? clearWorkingDirectoryLocalStateCandidates(mode, root, sessionId)
+            : { cleared: 0, hadFailure: false, paths: [] as string[] };
+          convergedCleanup = clearConvergedStateCandidates(mode, root, sessionId);
           let ownerSessionId: string | undefined;
           let ownerSessionCleanup = { cleared: 0, hadFailure: false, paths: [] as string[] };
           let ownerLegacyCleanup = { cleared: 0, hadFailure: false };
 
           if (
+            OWNER_SESSION_FALLBACK_MODES.has(mode) &&
             requestedSessionOwnedPaths.length === 0 &&
             completedSessionCleanup.cleared === 0 &&
             sessionCleanup.cleared === 0 &&
-            legacyCleanup.cleared === 0
+            legacyCleanup.cleared === 0 &&
+            convergedCleanup.cleared === 0 &&
+            workingDirectoryLocalCleanup.cleared === 0
           ) {
             ownerSessionId = findSingleOwningSessionForMode(mode, root, sessionId);
             if (ownerSessionId) {
@@ -708,6 +968,12 @@ export const stateClearTool: ToolDefinition<{
           if (sessionCleanup.cleared > 0) {
             ghostNoteParts.push(`removed ${sessionCleanup.cleared} recovered session file${sessionCleanup.cleared === 1 ? '' : 's'}`);
           }
+          if (workingDirectoryLocalCleanup.cleared > 0) {
+            ghostNoteParts.push(`removed ${workingDirectoryLocalCleanup.cleared} workingDirectory-local state file${workingDirectoryLocalCleanup.cleared === 1 ? '' : 's'}`);
+          }
+          if (convergedCleanup.cleared > 0) {
+            ghostNoteParts.push(`removed ${convergedCleanup.cleared} converged state file${convergedCleanup.cleared === 1 ? '' : 's'}`);
+          }
           if (runtimeCleanup.cleared > 0) {
             ghostNoteParts.push(`removed ${runtimeCleanup.cleared} runtime artifact${runtimeCleanup.cleared === 1 ? '' : 's'}`);
           }
@@ -725,10 +991,38 @@ export const stateClearTool: ToolDefinition<{
             if (prunedMissions > 0) details.push(`pruned ${prunedMissions} HUD mission entry(ies)`);
             return details.length > 0 ? ` (${details.join(', ')})` : '';
           })();
+          const clearedStateOrArtifacts = requestedSessionOwnedPaths.length +
+            completedSessionCleanup.cleared +
+            sessionCleanup.cleared +
+            legacyCleanup.cleared +
+            convergedCleanup.cleared +
+            workingDirectoryLocalCleanup.cleared +
+            ownerSessionCleanup.cleared +
+            ownerLegacyCleanup.cleared +
+            runtimeCleanup.cleared;
+          if (!ownerSessionId && clearedStateOrArtifacts === 0 && success &&
+            !legacyCleanup.hadFailure &&
+            !sessionCleanup.hadFailure &&
+            !workingDirectoryLocalCleanup.hadFailure &&
+            !convergedCleanup.hadFailure &&
+            !completedSessionCleanup.hadFailure &&
+            !ownerSessionCleanup.hadFailure &&
+            !ownerLegacyCleanup.hadFailure &&
+            !runtimeCleanup.hadFailure
+          ) {
+            return {
+              content: [{
+                type: 'text' as const,
+                text: formatStateClearNoopMessage(mode, root, sessionId)
+              }]
+            };
+          }
           if (
             success &&
             !legacyCleanup.hadFailure &&
             !sessionCleanup.hadFailure &&
+            !workingDirectoryLocalCleanup.hadFailure &&
+            !convergedCleanup.hadFailure &&
             !completedSessionCleanup.hadFailure &&
             !ownerSessionCleanup.hadFailure &&
             !ownerLegacyCleanup.hadFailure &&
@@ -753,15 +1047,26 @@ export const stateClearTool: ToolDefinition<{
         // Fallback for modes not in registry (e.g., ralplan)
         const sessionCleanup = clearSessionOwnedStateCandidates(mode, root, sessionId);
         const legacyCleanup = clearLegacyStateCandidates(mode, root, sessionId);
+        const shouldUseLocalFallback = requestedSessionOwnedPaths.length === 0 &&
+          completedSessionCleanup.cleared === 0 &&
+          sessionCleanup.cleared === 0 &&
+          legacyCleanup.cleared === 0;
+        const workingDirectoryLocalCleanup = shouldUseLocalFallback
+          ? clearWorkingDirectoryLocalStateCandidates(mode, root, sessionId)
+          : { cleared: 0, hadFailure: false, paths: [] as string[] };
+        convergedCleanup = clearConvergedStateCandidates(mode, root, sessionId);
         let ownerSessionId: string | undefined;
         let ownerSessionCleanup = { cleared: 0, hadFailure: false, paths: [] as string[] };
         let ownerLegacyCleanup = { cleared: 0, hadFailure: false };
 
         if (
+          OWNER_SESSION_FALLBACK_MODES.has(mode) &&
           requestedSessionOwnedPaths.length === 0 &&
           completedSessionCleanup.cleared === 0 &&
           sessionCleanup.cleared === 0 &&
-          legacyCleanup.cleared === 0
+          legacyCleanup.cleared === 0 &&
+          convergedCleanup.cleared === 0 &&
+          workingDirectoryLocalCleanup.cleared === 0
         ) {
           ownerSessionId = findSingleOwningSessionForMode(mode, root, sessionId);
           if (ownerSessionId) {
@@ -789,6 +1094,12 @@ export const stateClearTool: ToolDefinition<{
         if (sessionCleanup.cleared > 0) {
           ghostNoteParts.push(`removed ${sessionCleanup.cleared} recovered session file${sessionCleanup.cleared === 1 ? '' : 's'}`);
         }
+        if (workingDirectoryLocalCleanup.cleared > 0) {
+          ghostNoteParts.push(`removed ${workingDirectoryLocalCleanup.cleared} workingDirectory-local state file${workingDirectoryLocalCleanup.cleared === 1 ? '' : 's'}`);
+        }
+        if (convergedCleanup.cleared > 0) {
+          ghostNoteParts.push(`removed ${convergedCleanup.cleared} converged state file${convergedCleanup.cleared === 1 ? '' : 's'}`);
+        }
         if (runtimeCleanup.cleared > 0) {
           ghostNoteParts.push(`removed ${runtimeCleanup.cleared} runtime artifact${runtimeCleanup.cleared === 1 ? '' : 's'}`);
         }
@@ -806,10 +1117,31 @@ export const stateClearTool: ToolDefinition<{
           if (prunedMissions > 0) details.push(`pruned ${prunedMissions} HUD mission entry(ies)`);
           return details.length > 0 ? ` (${details.join(', ')})` : '';
         })();
+        const clearedStateOrArtifacts = requestedSessionOwnedPaths.length +
+          completedSessionCleanup.cleared +
+          sessionCleanup.cleared +
+          legacyCleanup.cleared +
+          convergedCleanup.cleared +
+          workingDirectoryLocalCleanup.cleared +
+          ownerSessionCleanup.cleared +
+          ownerLegacyCleanup.cleared +
+          runtimeCleanup.cleared;
+        const hadFailure = legacyCleanup.hadFailure || sessionCleanup.hadFailure ||
+          workingDirectoryLocalCleanup.hadFailure || convergedCleanup.hadFailure ||
+          completedSessionCleanup.hadFailure || ownerSessionCleanup.hadFailure ||
+          ownerLegacyCleanup.hadFailure || runtimeCleanup.hadFailure;
+        if (!ownerSessionId && clearedStateOrArtifacts === 0 && !hadFailure) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: formatStateClearNoopMessage(mode, root, sessionId)
+            }]
+          };
+        }
         return {
           content: [{
             type: 'text' as const,
-            text: `${legacyCleanup.hadFailure || sessionCleanup.hadFailure || completedSessionCleanup.hadFailure || ownerSessionCleanup.hadFailure || ownerLegacyCleanup.hadFailure || runtimeCleanup.hadFailure ? 'Warning: Some files could not be removed' : 'Successfully cleared state'} for mode: ${mode} in session: ${sessionId}${ghostNote}${runtimeCleanupNote}`
+            text: `${hadFailure ? 'Warning: Some files could not be removed' : 'Successfully cleared state'} for mode: ${mode} in session: ${sessionId}${ghostNote}${runtimeCleanupNote}`
           }]
         };
       }
@@ -862,6 +1194,11 @@ export const stateClearTool: ToolDefinition<{
       if (extraLegacyCleanup.hadFailure) {
         errors.push('legacy path');
       }
+      const convergedCleanup = clearConvergedStateCandidates(mode, root);
+      clearedCount += convergedCleanup.cleared;
+      if (convergedCleanup.hadFailure) {
+        errors.push('converged paths');
+      }
       clearedCount += runtimeCleanup.cleared;
       if (runtimeCleanup.hadFailure) {
         errors.push('runtime artifacts');
@@ -909,7 +1246,7 @@ export const stateClearTool: ToolDefinition<{
         return {
           content: [{
             type: 'text' as const,
-            text: `No state found to clear for mode: ${mode}`
+            text: formatStateClearNoopMessage(mode, root)
           }]
         };
       }
@@ -953,22 +1290,32 @@ export const stateClearTool: ToolDefinition<{
 export const stateListActiveTool: ToolDefinition<{
   workingDirectory: z.ZodOptional<z.ZodString>;
   session_id: z.ZodOptional<z.ZodString>;
+  all: z.ZodOptional<z.ZodBoolean>;
 }> = {
   name: 'state_list_active',
-  description: 'List all currently active modes. Returns which modes have active state files.',
+  description: 'List all currently active modes. By default, scopes to the current session (OMC_SESSION_ID). Pass all:true to list active modes across all sessions.',
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   schema: {
     workingDirectory: z.string().optional().describe('Working directory (defaults to cwd)'),
-    session_id: z.string().optional().describe('Session ID for session-scoped state isolation. When provided, the tool operates only within that session. When omitted, the tool aggregates legacy state plus all session-scoped state (may include other sessions).'),
+    session_id: z.string().optional().describe('Explicit session ID to scope the listing. Overrides OMC_SESSION_ID when provided.'),
+    all: z.boolean().optional().describe('When true, list active modes across all sessions (legacy + every session-scoped dir). Overrides the default current-session scope.'),
   },
   handler: async (args) => {
-    const { workingDirectory, session_id } = args;
+    const { workingDirectory, session_id, all } = args;
 
     try {
       const root = validateWorkingDirectory(workingDirectory);
-      const sessionId = session_id as string | undefined;
 
-      // If session_id provided, show modes active for that specific session
+      // Resolve the effective session ID:
+      //   1. Explicit session_id arg wins (back-compat for callers that pass it directly).
+      //   2. all:true opts out of session scoping entirely → show everything.
+      //   3. Otherwise default to the current session via resolveSessionId({context:'cli'}).
+      const explicitSessionId = session_id as string | undefined;
+      const showAll = all === true;
+      const sessionId: string | undefined = explicitSessionId
+        ?? (showAll ? undefined : resolveSessionId({ context: 'cli' }));
+
+      // If session_id resolved (explicit or current session), show modes for that session
       if (sessionId) {
         validateSessionId(sessionId);
 
@@ -987,6 +1334,12 @@ export const stateListActiveTool: ToolDefinition<{
             }
           } catch {
             // Ignore parse errors
+          }
+        }
+
+        for (const mode of CONVERGED_STATE_PATH_MODES) {
+          if (!activeModes.includes(mode) && hasActiveConvergedState(mode, root, sessionId)) {
+            activeModes.push(mode);
           }
         }
 
@@ -1026,6 +1379,12 @@ export const stateListActiveTool: ToolDefinition<{
           } catch {
             // Ignore parse errors
           }
+        }
+      }
+
+      for (const mode of CONVERGED_STATE_PATH_MODES) {
+        if (!legacyActiveModes.includes(mode) && hasActiveConvergedState(mode, root)) {
+          legacyActiveModes.push(mode);
         }
       }
 
